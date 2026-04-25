@@ -1,7 +1,7 @@
 import Image from "next/image";
 import Link from "next/link";
-import { ModeSwitcher } from "@/components/ModeSwitcher";
 import { ChainStrip } from "@/components/ChainStrip";
+import { InteractiveCard } from "@/components/InteractiveCard";
 
 export default function Page() {
   return (
@@ -45,7 +45,7 @@ export default function Page() {
 
       <section className="px-4 pb-16">
         <div className="w-full max-w-[440px] mx-auto">
-          <ModeSwitcher />
+          <InteractiveCard />
         </div>
       </section>
 
