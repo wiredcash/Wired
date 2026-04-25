@@ -5,11 +5,15 @@ import { ComputeBudgetProgram, PublicKey, Transaction } from "@solana/web3.js";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { WalletMultiButton } from "@solana/wallet-adapter-react-ui";
 import {
+  TOKEN_DECIMALS,
   USDF_BASE_MINT,
   USDF_DECIMALS,
   planBuy,
+  planSell,
   quoteBuy,
+  quoteSell,
   tokensToMinOutQuarks,
+  usdfToMinOutQuarks,
 } from "@/lib/flipcash";
 import type { IndexedCurrency } from "@/lib/flipcash/index-currencies";
 import { fmtQuarks, parseInput } from "./format";
@@ -20,6 +24,8 @@ import { TokenPicker } from "./TokenPicker";
 import { CurrencyIcon } from "./CurrencyIcon";
 import { TokenIcon } from "./TokenIcon";
 
+type Direction = "buy" | "sell";
+
 const SLIPPAGE_OPTIONS_BPS = [50, 100, 300]; // 0.5% / 1% / 3%
 
 export function Swap() {
@@ -28,6 +34,7 @@ export function Swap() {
   const [refresh, setRefresh] = useState(0);
   const currencies = useCurrencies(refresh);
   const [selected, setSelected] = useState<IndexedCurrency | null>(null);
+  const [direction, setDirection] = useState<Direction>("buy");
   const [pickerOpen, setPickerOpen] = useState(false);
   const [input, setInput] = useState("");
   const [slippageBps, setSlippageBps] = useState<number>(100);
@@ -38,7 +45,17 @@ export function Swap() {
     | { kind: "success"; signature: string }
   >({ kind: "idle" });
 
+  const isBuy = direction === "buy";
+
   const usdf = useTokenBalance(publicKey, USDF_BASE_MINT, refresh);
+  const targetMint = useMemo(
+    () => (selected ? new PublicKey(selected.mint) : null),
+    [selected],
+  );
+  const target = useTokenBalance(publicKey, targetMint ?? USDF_BASE_MINT, refresh);
+  // useTokenBalance always needs a mint; reuse USDF as a stable placeholder
+  // when no currency is selected yet — its result is unused in that branch.
+  const targetQuarks = targetMint ? target.quarks : null;
 
   // Auto-pick the most-liquid currency on first load.
   useEffect(() => {
@@ -48,27 +65,69 @@ export function Swap() {
     }
   }, [currencies.data, selected]);
 
+  const sourceDecimals = isBuy ? USDF_DECIMALS : TOKEN_DECIMALS;
+  const destDecimals = isBuy ? TOKEN_DECIMALS : USDF_DECIMALS;
+  const sourceBalance = isBuy ? usdf.quarks : targetQuarks;
+  const destBalance = isBuy ? targetQuarks : usdf.quarks;
+
   const inputQuarks = useMemo(
-    () => parseInput(input, USDF_DECIMALS),
-    [input],
+    () => parseInput(input, sourceDecimals),
+    [input, sourceDecimals],
   );
 
-  const quote = useMemo(() => {
+  const buyQuote = useMemo(() => {
     if (
-      !selected ||
-      !selected.reserveTokenQuarks ||
-      !selected.reserveUsdfQuarks ||
+      !isBuy ||
+      !selected?.reserveTokenQuarks ||
+      !selected?.reserveUsdfQuarks ||
       inputQuarks === null ||
       inputQuarks <= 0n
-    ) {
+    )
       return null;
-    }
     return quoteBuy(
       BigInt(selected.reserveTokenQuarks),
       BigInt(selected.reserveUsdfQuarks),
       inputQuarks,
     );
-  }, [selected, inputQuarks]);
+  }, [isBuy, selected, inputQuarks]);
+
+  const sellQuote = useMemo(() => {
+    if (
+      isBuy ||
+      !selected?.reserveTokenQuarks ||
+      !selected?.reserveUsdfQuarks ||
+      selected?.sellFeeBps === null ||
+      inputQuarks === null ||
+      inputQuarks <= 0n
+    )
+      return null;
+    return quoteSell(
+      BigInt(selected!.reserveTokenQuarks!),
+      BigInt(selected!.reserveUsdfQuarks!),
+      inputQuarks,
+      selected!.sellFeeBps ?? 100,
+    );
+  }, [isBuy, selected, inputQuarks]);
+
+  const expectedOutDisplay = isBuy
+    ? buyQuote
+      ? fmtCompactNumber(buyQuote.expectedTokensOut)
+      : "0"
+    : sellQuote
+      ? fmtCompactNumber(sellQuote.expectedUsdfOut)
+      : "0";
+
+  const priceLabel = useMemo(() => {
+    if (!selected) return "—";
+    if (isBuy) {
+      return buyQuote
+        ? `≈ ${fmtUsd(buyQuote.effectivePriceUsdf)} / ${selected.symbol}`
+        : "spot price";
+    }
+    return sellQuote
+      ? `≈ ${fmtUsd(sellQuote.effectivePriceUsdf)} / ${selected.symbol}`
+      : "spot price";
+  }, [isBuy, selected, buyQuote, sellQuote]);
 
   const validation = useMemo<{ ok: boolean; reason?: string }>(() => {
     if (!connected || !publicKey)
@@ -76,49 +135,101 @@ export function Swap() {
     if (!selected) return { ok: false, reason: "Select a currency" };
     if (!selected.pool || !selected.vaultA || !selected.vaultB)
       return { ok: false, reason: "Currency has no pool" };
-    if (!input) return { ok: false, reason: "Enter a USDF amount" };
+    if (!input)
+      return {
+        ok: false,
+        reason: isBuy ? "Enter a USDF amount" : `Enter ${selected.symbol} amount`,
+      };
     if (inputQuarks === null) return { ok: false, reason: "Invalid amount" };
     if (inputQuarks <= 0n) return { ok: false, reason: "Amount must be > 0" };
-    if (usdf.quarks !== null && inputQuarks > usdf.quarks)
-      return { ok: false, reason: "Insufficient USDF" };
+    if (sourceBalance !== null && inputQuarks > sourceBalance) {
+      return {
+        ok: false,
+        reason: `Insufficient ${isBuy ? "USDF" : selected.symbol}`,
+      };
+    }
+    if (!isBuy) {
+      // Selling needs the pool to have at least the gross USDF available.
+      if (!sellQuote) return { ok: false, reason: "Computing quote…" };
+      if (sellQuote.expectedUsdfOut <= 0)
+        return { ok: false, reason: "Pool has no USDF reserve" };
+    }
     return { ok: true };
-  }, [connected, publicKey, selected, input, inputQuarks, usdf.quarks]);
+  }, [
+    connected,
+    publicKey,
+    selected,
+    input,
+    inputQuarks,
+    sourceBalance,
+    sellQuote,
+    isBuy,
+  ]);
 
-  async function handleBuy() {
+  function flip() {
+    setDirection((d) => (d === "buy" ? "sell" : "buy"));
+    setInput("");
+    setStatus({ kind: "idle" });
+  }
+
+  function setMax() {
+    if (sourceBalance === null || sourceBalance <= 0n) return;
+    setInput(fmtQuarks(sourceBalance, sourceDecimals, sourceDecimals));
+  }
+
+  async function handleSubmit() {
     if (
       !publicKey ||
       !selected ||
       !selected.pool ||
       !selected.vaultA ||
       !selected.vaultB ||
-      inputQuarks === null ||
-      !quote
+      inputQuarks === null
     )
       return;
     setSubmitting(true);
     setStatus({ kind: "idle" });
     try {
-      const minOut = tokensToMinOutQuarks(
-        quote.expectedTokensOut,
-        slippageBps,
-      );
-      const plan = await planBuy(connection, {
-        buyer: publicKey,
-        pool: new PublicKey(selected.pool),
-        targetMint: new PublicKey(selected.mint),
-        vaultA: new PublicKey(selected.vaultA),
-        vaultB: new PublicKey(selected.vaultB),
-        inAmountUsdfQuarks: inputQuarks,
-        minAmountOutQuarks: minOut,
-      });
-
       const tx = new Transaction();
       tx.add(
         ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50_000 }),
         ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 }),
-        ...plan.preInstructions,
-        plan.buyIx,
       );
+
+      if (isBuy) {
+        if (!buyQuote) throw new Error("missing buy quote");
+        const minOut = tokensToMinOutQuarks(
+          buyQuote.expectedTokensOut,
+          slippageBps,
+        );
+        const plan = await planBuy(connection, {
+          buyer: publicKey,
+          pool: new PublicKey(selected.pool),
+          targetMint: new PublicKey(selected.mint),
+          vaultA: new PublicKey(selected.vaultA),
+          vaultB: new PublicKey(selected.vaultB),
+          inAmountUsdfQuarks: inputQuarks,
+          minAmountOutQuarks: minOut,
+        });
+        tx.add(...plan.preInstructions, plan.buyIx);
+      } else {
+        if (!sellQuote) throw new Error("missing sell quote");
+        const minOut = usdfToMinOutQuarks(
+          sellQuote.expectedUsdfOut,
+          slippageBps,
+        );
+        const plan = await planSell(connection, {
+          seller: publicKey,
+          pool: new PublicKey(selected.pool),
+          targetMint: new PublicKey(selected.mint),
+          vaultA: new PublicKey(selected.vaultA),
+          vaultB: new PublicKey(selected.vaultB),
+          inAmountTokenQuarks: inputQuarks,
+          minAmountOutUsdfQuarks: minOut,
+        });
+        tx.add(...plan.preInstructions, plan.sellIx);
+      }
+
       const sig = await sendTransaction(tx, connection);
       const latest = await connection.getLatestBlockhash();
       await connection.confirmTransaction(
@@ -135,6 +246,20 @@ export function Swap() {
     }
   }
 
+  const sourceTokenChip = isBuy ? (
+    <UsdfChip />
+  ) : (
+    <CurrencyChip selected={selected} onClick={() => setPickerOpen(true)} />
+  );
+  const destTokenChip = isBuy ? (
+    <CurrencyChip selected={selected} onClick={() => setPickerOpen(true)} />
+  ) : (
+    <UsdfChip />
+  );
+
+  const activeQuote = isBuy ? buyQuote : sellQuote;
+  const sellFeeBps = selected?.sellFeeBps ?? null;
+
   return (
     <div className="card p-2.5 shadow-card">
       <div className="flex items-center justify-between px-2.5 pt-1.5 pb-2.5">
@@ -144,7 +269,7 @@ export function Swap() {
             Swap
           </span>
           <span className="text-[12px] text-white/35">
-            · USDF → flipcash
+            {isBuy ? "· buy" : "· sell"}
           </span>
         </div>
         <WalletMultiButton />
@@ -158,17 +283,15 @@ export function Swap() {
             <span>
               Balance{" "}
               <span className="tabular-nums text-white/65">
-                {usdf.quarks === null
+                {sourceBalance === null
                   ? "—"
-                  : fmtQuarks(usdf.quarks, USDF_DECIMALS)}
+                  : fmtQuarks(sourceBalance, sourceDecimals)}
               </span>
             </span>
-            {usdf.quarks !== null && usdf.quarks > 0n && (
+            {sourceBalance !== null && sourceBalance > 0n && (
               <button
                 type="button"
-                onClick={() =>
-                  setInput(fmtQuarks(usdf.quarks!, USDF_DECIMALS, USDF_DECIMALS))
-                }
+                onClick={setMax}
                 className="px-1.5 py-0.5 rounded-md text-[10.5px] font-semibold text-spark hover:bg-spark/10 transition-colors"
               >
                 MAX
@@ -184,91 +307,49 @@ export function Swap() {
             onChange={(e) => setInput(e.target.value)}
             className="swap-input flex-1 min-w-0 bg-transparent outline-none text-[34px] sm:text-[40px] font-semibold tabular-nums tracking-[-0.03em] placeholder:text-white/15"
           />
-          <div className="shrink-0 flex items-center gap-1.5 pl-1 pr-2.5 py-1 rounded-full bg-white/[0.05] border border-white/[0.08]">
-            <TokenIcon symbol="USDF" size={20} />
-            <span className="text-[13px] font-semibold tracking-tight">
-              USDF
-            </span>
-          </div>
+          {sourceTokenChip}
         </div>
       </div>
 
-      <div className="flex justify-center -my-2.5 relative z-10 pointer-events-none">
-        <div className="w-9 h-9 rounded-full bg-elevated border border-white/[0.10] flex items-center justify-center text-white/55">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none">
-            <path
-              d="M12 4v16m0 0l-6-6m6 6l6-6"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            />
-          </svg>
-        </div>
-      </div>
+      <FlipButton onClick={flip} />
 
       {/* You receive */}
       <div className="card-inset px-4 py-3.5">
         <div className="flex items-center justify-between text-[11px] text-white/40 mb-1.5 uppercase tracking-wider">
           <span>You receive</span>
           <span className="normal-case tracking-normal text-white/40">
-            {selected
-              ? quote
-                ? `≈ ${fmtUsd(quote.effectivePriceUsdf)} / ${selected.symbol}`
-                : "spot price"
-              : "—"}
+            {priceLabel}
           </span>
         </div>
         <div className="flex items-center gap-3">
           <div className="flex-1 min-w-0 text-[34px] sm:text-[40px] font-semibold tabular-nums tracking-[-0.03em] text-white/85">
-            {quote ? fmtCompactNumber(quote.expectedTokensOut) : "0"}
+            {expectedOutDisplay}
           </div>
-          <button
-            type="button"
-            onClick={() => setPickerOpen(true)}
-            className="shrink-0 flex items-center gap-1.5 pl-1 pr-2.5 py-1 rounded-full bg-white/[0.05] border border-white/[0.08] hover:border-white/20 hover:bg-white/[0.08] transition-colors"
-          >
-            {selected ? (
-              <>
-                <CurrencyIcon
-                  src={selected.image}
-                  symbol={selected.symbol}
-                  size={22}
-                />
-                <span className="text-[13px] font-semibold tracking-tight max-w-[80px] truncate">
-                  {selected.symbol}
-                </span>
-                <Chevron />
-              </>
-            ) : (
-              <>
-                <span className="text-[13px] font-semibold tracking-tight pl-2">
-                  Select
-                </span>
-                <Chevron />
-              </>
-            )}
-          </button>
+          {destTokenChip}
         </div>
 
-        {selected && quote && (
+        {selected && activeQuote && (
           <div className="mt-3 flex items-center justify-between text-[11px] text-white/45">
             <span>
               Impact{" "}
               <span
                 className={
-                  quote.priceImpact > 0.05
+                  activeQuote.priceImpact > 0.05
                     ? "text-err"
-                    : quote.priceImpact > 0.01
+                    : activeQuote.priceImpact > 0.01
                       ? "text-spark"
                       : "text-white/65"
                 }
               >
-                {fmtPct(quote.priceImpact, 2)}
+                {fmtPct(activeQuote.priceImpact, 2)}
               </span>
             </span>
             <span className="tabular-nums">
-              Mcap {fmtUsd(quote.marketCapUsdf)}
+              {isBuy
+                ? `Mcap ${fmtUsd(activeQuote.marketCapUsdf)}`
+                : `Fee ${
+                    sellFeeBps !== null ? (sellFeeBps / 100).toFixed(2) : "1.00"
+                  }%`}
             </span>
           </div>
         )}
@@ -300,15 +381,15 @@ export function Swap() {
 
       <button
         type="button"
-        onClick={handleBuy}
+        onClick={handleSubmit}
         disabled={!validation.ok || submitting}
         className="mt-2 w-full h-12 rounded-2xl bg-white text-black disabled:bg-white/[0.05] disabled:text-white/40 disabled:hover:shadow-none hover:shadow-glow font-semibold text-[14px] tracking-tight transition-all duration-200 disabled:cursor-not-allowed"
       >
         {submitting
           ? "Confirming…"
           : validation.ok
-            ? `Buy ${selected?.symbol ?? ""}`
-            : (validation.reason ?? "Buy")}
+            ? `${isBuy ? "Buy" : "Sell"} ${selected?.symbol ?? ""}`
+            : (validation.reason ?? (isBuy ? "Buy" : "Sell"))}
       </button>
 
       {status.kind === "success" && (
@@ -318,7 +399,7 @@ export function Swap() {
           rel="noreferrer"
           className="mt-3 mx-1 flex items-center justify-between gap-2 rounded-xl bg-ok/[0.07] border border-ok/20 px-3 py-2.5 text-[12.5px] text-ok hover:bg-ok/[0.12] transition-colors"
         >
-          <span>✅ Buy landed</span>
+          <span>✅ {isBuy ? "Buy" : "Sell"} landed</span>
           <span className="font-mono text-[11px] truncate max-w-[160px] opacity-80">
             {status.signature.slice(0, 10)}…
           </span>
@@ -336,6 +417,75 @@ export function Swap() {
         onSelect={(c) => setSelected(c)}
         currencies={currencies.data}
       />
+    </div>
+  );
+}
+
+function CurrencyChip({
+  selected,
+  onClick,
+}: {
+  selected: IndexedCurrency | null;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="shrink-0 flex items-center gap-1.5 pl-1 pr-2.5 py-1 rounded-full bg-white/[0.05] border border-white/[0.08] hover:border-white/20 hover:bg-white/[0.08] transition-colors"
+    >
+      {selected ? (
+        <>
+          <CurrencyIcon
+            src={selected.image}
+            symbol={selected.symbol}
+            size={22}
+          />
+          <span className="text-[13px] font-semibold tracking-tight max-w-[80px] truncate">
+            {selected.symbol}
+          </span>
+          <Chevron />
+        </>
+      ) : (
+        <>
+          <span className="text-[13px] font-semibold tracking-tight pl-2">
+            Select
+          </span>
+          <Chevron />
+        </>
+      )}
+    </button>
+  );
+}
+
+function UsdfChip() {
+  return (
+    <div className="shrink-0 flex items-center gap-1.5 pl-1 pr-2.5 py-1 rounded-full bg-white/[0.05] border border-white/[0.08]">
+      <TokenIcon symbol="USDF" size={20} />
+      <span className="text-[13px] font-semibold tracking-tight">USDF</span>
+    </div>
+  );
+}
+
+function FlipButton({ onClick }: { onClick: () => void }) {
+  return (
+    <div className="flex justify-center -my-2.5 relative z-10 pointer-events-none">
+      <button
+        type="button"
+        onClick={onClick}
+        className="pointer-events-auto w-9 h-9 rounded-full bg-elevated border border-white/[0.10] flex items-center justify-center hover:bg-white/[0.08] hover:border-white/20 hover:rotate-180 transition-all duration-300 shadow-card"
+        aria-label="flip direction"
+      >
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none">
+          <path
+            d="M7 4v12m0 0l-4-4m4 4l4-4M17 20V8m0 0l-4 4m4-4l4 4"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+        </svg>
+      </button>
     </div>
   );
 }
