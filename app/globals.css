@@ -1,0 +1,98 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body {
+  background: #000;
+  color: #fff;
+  font-family: "Inter", ui-sans-serif, system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  font-feature-settings: "ss01", "cv11";
+}
+
+/* Subtle ambient: a vignette spotlight under the hero, plus a faint grid. */
+.bg-stage {
+  background:
+    radial-gradient(80% 50% at 50% -10%, rgba(255, 233, 75, 0.07) 0%, rgba(0,0,0,0) 60%),
+    radial-gradient(50% 35% at 50% 110%, rgba(255, 255, 255, 0.04) 0%, rgba(0,0,0,0) 70%),
+    #000;
+}
+.bg-grid::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background-image:
+    linear-gradient(rgba(255,255,255,0.025) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,255,255,0.025) 1px, transparent 1px);
+  background-size: 56px 56px;
+  mask-image: radial-gradient(ellipse at center, rgba(0,0,0,0.55) 0%, rgba(0,0,0,0) 70%);
+  -webkit-mask-image: radial-gradient(ellipse at center, rgba(0,0,0,0.55) 0%, rgba(0,0,0,0) 70%);
+}
+
+/* Hairline divider helpers */
+.hairline { border-color: rgba(255,255,255,0.07); }
+
+/* Wallet adapter — make it match the brand */
+.wallet-adapter-button-trigger {
+  background: #fff !important;
+  color: #000 !important;
+  border-radius: 999px !important;
+  height: 36px !important;
+  padding: 0 14px !important;
+  font-weight: 600 !important;
+  font-family: "Inter", system-ui, sans-serif !important;
+  font-size: 13px !important;
+  letter-spacing: -0.01em;
+  transition: transform 120ms ease, box-shadow 200ms ease, background 200ms ease;
+  box-shadow: 0 0 0 1px rgba(255,255,255,0.04);
+}
+.wallet-adapter-button-trigger:hover {
+  background: #f4f4f5 !important;
+  box-shadow: 0 0 30px rgba(255,233,75,0.18), 0 0 0 1px rgba(255,255,255,0.08);
+}
+.wallet-adapter-button-trigger .wallet-adapter-button-start-icon {
+  margin-right: 6px;
+}
+.wallet-adapter-modal-wrapper {
+  background: #0a0a0a !important;
+  border: 1px solid rgba(255,255,255,0.07) !important;
+  border-radius: 18px !important;
+}
+.wallet-adapter-modal-button-close {
+  background: #111 !important;
+}
+.wallet-adapter-modal-list .wallet-adapter-button {
+  background: #111 !important;
+  color: #fff !important;
+  border-radius: 12px !important;
+}
+.wallet-adapter-modal-list .wallet-adapter-button:hover {
+  background: #181818 !important;
+}
+
+/* Cards */
+.card {
+  background: linear-gradient(180deg, rgba(255,255,255,0.025), rgba(255,255,255,0)) , #0a0a0a;
+  border: 1px solid rgba(255,255,255,0.07);
+  border-radius: 24px;
+}
+.card-inset {
+  background: #060606;
+  border: 1px solid rgba(255,255,255,0.06);
+  border-radius: 16px;
+}
+
+/* Token input large numeric entry */
+.swap-input::-webkit-outer-spin-button,
+.swap-input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
