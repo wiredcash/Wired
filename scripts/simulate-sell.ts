@@ -18,7 +18,7 @@ import { TOKEN_DECIMALS } from "../lib/flipcash";
 
 const RPC =
   process.env.SOLANA_RPC_URL ??
-  "https://mainnet.helius-rpc.com/?api-key=027318d4-f3d4-4ff3-a490-c945bdb3a0af";
+  "https://api.mainnet-beta.solana.com";
 
 const OUTPUT_MINTS: Record<string, PublicKey> = {
   USDF: USDF_MINT,

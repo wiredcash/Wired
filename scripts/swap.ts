@@ -43,7 +43,7 @@ function parseArgs(argv: string[]): Args {
   let keypair = resolve(process.cwd(), "keypair.json");
   let rpc =
     process.env.SOLANA_RPC_URL ??
-    "https://mainnet.helius-rpc.com/?api-key=027318d4-f3d4-4ff3-a490-c945bdb3a0af";
+    "https://api.mainnet-beta.solana.com";
   let dryRun = false;
 
   for (let i = 0; i < argv.length; i++) {

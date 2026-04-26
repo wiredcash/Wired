@@ -6,7 +6,7 @@ import { FLIPCASH_USDF_USDC_POOL, fetchPoolState } from "../lib/usdf-swap";
 async function main() {
   const rpc =
     process.env.SOLANA_RPC_URL ??
-    "https://mainnet.helius-rpc.com/?api-key=027318d4-f3d4-4ff3-a490-c945bdb3a0af";
+    "https://api.mainnet-beta.solana.com";
   const conn = new Connection(rpc, "confirmed");
 
   const pool = await fetchPoolState(conn, FLIPCASH_USDF_USDC_POOL);
