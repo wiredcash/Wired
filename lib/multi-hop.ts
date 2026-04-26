@@ -42,10 +42,11 @@ import {
 } from "./jupiter";
 import { WIRE_FEE_BPS, WIRE_FEE_OWNER, feeEnabled } from "./jupiter/fee";
 import { QUARKS_PER_TOKEN } from "./flipcash";
+import { buildJitoTipIx } from "./jito";
 
 export type HopRoute = "usdf-direct" | "usdc-bridge" | "jupiter-bridge";
 export type SellRoute = "to-usdf" | "to-usdc" | "to-jupiter";
-export type Provider = "curve" | "jupiter-direct";
+export type Provider = "curve" | "jupiter-direct" | "split";
 
 /** A single human-readable hop in the chosen swap route. */
 export type RouteStep = {
@@ -134,6 +135,18 @@ export type MultiHopBuyInput = {
 };
 
 /**
+ * Optional knobs the SOL-split planner uses to align two leg-txs into a
+ * single Jito bundle: shared blockhash, extra trailing ixs (the tip).
+ */
+type LegOpts = {
+  blockhash?: string;
+  /** Appended after all swap/buy ixs but before tx is serialized. */
+  trailingIxs?: TransactionInstruction[];
+  /** Optional label override for the SignableStep. */
+  label?: string;
+};
+
+/**
  * Curve-only buy planner — input → (Jupiter→USDC if needed) → bridge USDC→USDF
  * if needed → flipcash buy. Always single-tx (caps Jupiter at maxAccounts).
  *
@@ -144,6 +157,7 @@ async function planCurveBuy(
   connection: Connection,
   input: MultiHopBuyInput,
   targetSymbol: string,
+  opts: LegOpts = {},
 ): Promise<MultiHopBuyPlan> {
   const route = pickBuyRoute(input.inputMint);
 
@@ -277,10 +291,11 @@ async function planCurveBuy(
     minTokensOutQuarks,
   );
 
-  // ─── Pack into 1 or 2 transactions ──────────────────────────────────
-  const { blockhash } = await connection.getLatestBlockhash("confirmed");
+  // ─── Pack into 1 transaction ──────────────────────────────────────
+  const blockhash =
+    opts.blockhash ??
+    (await connection.getLatestBlockhash("confirmed")).blockhash;
 
-  // Try single-tx first.
   const singleIxs: TransactionInstruction[] = [
     ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50_000 }),
     ComputeBudgetProgram.setComputeUnitLimit({
@@ -292,6 +307,7 @@ async function planCurveBuy(
     ...(jupiterIxs?.cleanup ? [jupiterIxs.cleanup] : []),
     ...(bridgeIx ? [bridgeIx] : []),
     buyIx,
+    ...(opts.trailingIxs ?? []),
   ];
   const singleTx = buildV0Tx(singleIxs, input.user, blockhash, jupiterAlts);
 
@@ -303,7 +319,13 @@ async function planCurveBuy(
       atomic: true,
       txs: [
         {
-          label: route === "jupiter-bridge" ? "Multi-hop swap" : route === "usdc-bridge" ? "Bridge + buy" : "Buy",
+          label:
+            opts.label ??
+            (route === "jupiter-bridge"
+              ? "Multi-hop swap"
+              : route === "usdc-bridge"
+                ? "Bridge + buy"
+                : "Buy"),
           tx: singleTx,
           size: singleTx.serialize().length,
         },
@@ -329,6 +351,7 @@ async function planJupiterDirectBuy(
   connection: Connection,
   input: MultiHopBuyInput,
   targetSymbol: string,
+  opts: LegOpts = {},
 ): Promise<MultiHopBuyPlan | null> {
   // Skip when input mint == output mint (no-op).
   if (input.inputMint.equals(input.target.mint)) return null;
@@ -381,7 +404,9 @@ async function planJupiterDirectBuy(
   if (fee) ataPairs.push([fee.ata, input.target.mint]);
   const setupAtas = await buildAtaSetups(connection, input.user, ataPairs);
 
-  const { blockhash } = await connection.getLatestBlockhash("confirmed");
+  const blockhash =
+    opts.blockhash ??
+    (await connection.getLatestBlockhash("confirmed")).blockhash;
   const ixsList: TransactionInstruction[] = [
     ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50_000 }),
     ComputeBudgetProgram.setComputeUnitLimit({ units: 600_000 }),
@@ -389,6 +414,7 @@ async function planJupiterDirectBuy(
     ...setupAtas,
     ixs.swap,
     ...(ixs.cleanup ? [ixs.cleanup] : []),
+    ...(opts.trailingIxs ?? []),
   ];
   const tx = buildV0Tx(ixsList, input.user, blockhash, alts);
   const size = tx.serialize().length;
@@ -410,7 +436,7 @@ async function planJupiterDirectBuy(
       },
     ],
     atomic: true,
-    txs: [{ label: "Direct swap", tx, size }],
+    txs: [{ label: opts.label ?? "Direct swap", tx, size }],
     minTokensOutQuarks,
     expectedTokensOut,
     worstUsdfQuarks: 0n,
@@ -419,8 +445,84 @@ async function planJupiterDirectBuy(
 }
 
 /**
- * Aggregator: race the curve path and the direct-Jupiter path, return the
- * one that delivers more target tokens. Single-tx and atomic regardless.
+ * SOL-split buy: emit two transactions sharing a blockhash, intended to
+ * be submitted as a single Jito bundle (atomic, one wallet prompt via
+ * `signAllTransactions`).
+ *
+ *   tx1 — Jupiter direct: SOL → target for `directIn` SOL
+ *   tx2 — curve path:     SOL → USDC → bridge → flipcash buy for the rest,
+ *         plus a Jito tip ix appended.
+ *
+ * Returns null when the input mint isn't SOL, the fraction is degenerate,
+ * or either leg's Jupiter quote / tx-size check fails. Combined output is
+ * the sum of both legs.
+ */
+async function planSolSplitBuy(
+  connection: Connection,
+  input: MultiHopBuyInput,
+  jupiterDirectFraction: number,
+  targetSymbol: string,
+): Promise<MultiHopBuyPlan | null> {
+  if (!input.inputMint.equals(SOL_MINT)) return null;
+  if (jupiterDirectFraction <= 0 || jupiterDirectFraction >= 1) return null;
+
+  // Fraction is bps-scaled to keep amounts as bigints.
+  const fracBps = BigInt(Math.floor(jupiterDirectFraction * 10_000));
+  const directIn = (input.inAmount * fracBps) / 10_000n;
+  const curveIn = input.inAmount - directIn;
+  if (directIn === 0n || curveIn === 0n) return null;
+
+  const { blockhash } = await connection.getLatestBlockhash("confirmed");
+
+  const [directPlan, curvePlan] = await Promise.all([
+    planJupiterDirectBuy(
+      connection,
+      { ...input, inAmount: directIn },
+      targetSymbol,
+      { blockhash, label: "Jupiter direct" },
+    ),
+    planCurveBuy(
+      connection,
+      { ...input, inAmount: curveIn },
+      targetSymbol,
+      {
+        blockhash,
+        // Tip lives in the curve tx so the "anchor" tx in the bundle is
+        // the one with the most state writes (better landing odds).
+        trailingIxs: [buildJitoTipIx(input.user)],
+        label: "Curve + tip",
+      },
+    ),
+  ]);
+
+  if (!directPlan) return null;
+
+  return {
+    provider: "split",
+    route: curvePlan.route,
+    routeSteps: [...directPlan.routeSteps, ...curvePlan.routeSteps],
+    atomic: true, // Jito bundle — both txs land in the same block or none do.
+    txs: [...directPlan.txs, ...curvePlan.txs],
+    minTokensOutQuarks:
+      directPlan.minTokensOutQuarks + curvePlan.minTokensOutQuarks,
+    expectedTokensOut:
+      directPlan.expectedTokensOut + curvePlan.expectedTokensOut,
+    worstUsdfQuarks: curvePlan.worstUsdfQuarks,
+    jupiterQuote: null,
+  };
+}
+
+/**
+ * Aggregator. Always quotes the curve path and the direct-Jupiter path
+ * in parallel and picks the winner. For SOL inputs where the two are
+ * within 25% of each other (splitting only helps when neither path
+ * dominates), it then fires a 50/50 split quote and uses that if it
+ * beats both. Single-tx for curve/direct, two-tx (atomic via Jito
+ * bundle, one wallet prompt) for split.
+ *
+ * The conditional split avoids two extra Jupiter calls on every swap
+ * — small inputs and lopsided pairs never benefit from splitting, so
+ * skipping the quote is free quality.
  */
 export async function planMultiHopBuy(
   connection: Connection,
@@ -431,10 +533,37 @@ export async function planMultiHopBuy(
     planCurveBuy(connection, input, targetSymbol),
     planJupiterDirectBuy(connection, input, targetSymbol).catch(() => null),
   ]);
-  if (jupiterPlan && jupiterPlan.expectedTokensOut > curvePlan.expectedTokensOut) {
-    return jupiterPlan;
+
+  let best: MultiHopBuyPlan = curvePlan;
+  if (jupiterPlan && jupiterPlan.expectedTokensOut > best.expectedTokensOut) {
+    best = jupiterPlan;
   }
-  return curvePlan;
+
+  // Try a 50/50 split when:
+  //   • input is SOL (the only direction where splitting beats the
+  //     single-tx winner today — USDF/USDC always win curve outright),
+  //   • both paths returned (we need both quotes to size each leg),
+  //   • the winners are within 25% of each other (splitting can't help
+  //     when one path is a 5× blowout).
+  if (
+    input.inputMint.equals(SOL_MINT) &&
+    jupiterPlan &&
+    Math.min(curvePlan.expectedTokensOut, jupiterPlan.expectedTokensOut) /
+      Math.max(curvePlan.expectedTokensOut, jupiterPlan.expectedTokensOut) >
+      0.75
+  ) {
+    const split = await planSolSplitBuy(
+      connection,
+      input,
+      0.5,
+      targetSymbol,
+    ).catch(() => null);
+    if (split && split.expectedTokensOut > best.expectedTokensOut) {
+      best = split;
+    }
+  }
+
+  return best;
 }
 
 // ─────────────────────────────────────────────────────────────────────

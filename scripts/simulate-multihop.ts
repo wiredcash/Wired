@@ -107,6 +107,7 @@ async function main() {
         atomic: plan.atomic,
         txCount: plan.txs.length,
         txSizes: plan.txs.map((t) => ({ label: t.label, size: t.size })),
+        bundle: plan.txs.length > 1 ? "Jito bundle (one signAllTransactions prompt)" : "single tx",
         worstUsdfQuarks: plan.worstUsdfQuarks.toString(),
         minTokensOutQuarks: plan.minTokensOutQuarks.toString(),
         expectedTokensOut: plan.expectedTokensOut,

@@ -19,6 +19,7 @@ import {
   type SignableStep,
 } from "@/lib/multi-hop";
 import { confirmSignaturePolling } from "@/lib/confirm";
+import { sendBundle, pollBundleLanded } from "@/lib/jito";
 import type { IndexedCurrency } from "@/lib/flipcash/index-currencies";
 import { fmtQuarks, parseInput } from "./format";
 import { fmtCompactNumber, fmtPct, fmtUsd } from "./format-numbers";
@@ -58,7 +59,12 @@ const SIDE_TOKEN: Record<
 
 export function Swap() {
   const { connection } = useConnection();
-  const { publicKey, sendTransaction, connected } = useWallet();
+  const {
+    publicKey,
+    sendTransaction,
+    signAllTransactions,
+    connected,
+  } = useWallet();
 
   const [refresh, setRefresh] = useState(0);
   const currencies = useCurrencies(refresh);
@@ -626,13 +632,34 @@ export function Swap() {
             )
           ).txs;
 
-      const sigs: string[] = [];
-      for (let i = 0; i < txs.length; i++) {
-        if (txs.length > 1) {
-          setSubmitProgress(`${i + 1}/${txs.length} · ${txs[i].label}`);
+      // Submission split into two paths:
+      //   • single-tx (all curve / direct routes) — existing wallet flow
+      //   • multi-tx  (split routing via Jito bundle) — one wallet prompt
+      //                via signAllTransactions, then submit as a Jito
+      //                bundle so both legs land atomically.
+      let sigs: string[] = [];
+      if (txs.length === 1) {
+        const sig = await sendStep(txs[0]);
+        sigs = [sig];
+      } else {
+        if (!signAllTransactions) {
+          throw new Error(
+            "Connected wallet doesn't support batch signing — split routing requires it.",
+          );
         }
-        const sig = await sendStep(txs[i]);
-        sigs.push(sig);
+        setSubmitProgress(`Signing ${txs.length} txs…`);
+        const signed = await signAllTransactions(txs.map((t) => t.tx));
+        setSubmitProgress(`Submitting Jito bundle…`);
+        try {
+          const bundleId = await sendBundle(signed);
+          setSubmitProgress(`Confirming bundle…`);
+          const status = await pollBundleLanded(bundleId, {
+            timeoutMs: 60_000,
+          });
+          sigs = status.transactions ?? [];
+        } catch (err) {
+          throw enrichTxError(err, "Bundle");
+        }
       }
       setStatus({
         kind: "success",
