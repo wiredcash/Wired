@@ -20,6 +20,7 @@ export function useJupiterQuote(
   outputMint: string,
   amountQuarks: bigint | null,
   slippageBps: number,
+  maxAccounts?: number,
 ): LiveJupiterQuote {
   const [quote, setQuote] = useState<JupiterQuote | null>(null);
   const [loading, setLoading] = useState(false);
@@ -44,6 +45,7 @@ export function useJupiterQuote(
           amount: amountQuarks.toString(),
           slippageBps,
           restrictIntermediateTokens: true,
+          maxAccounts,
         });
         if (!cancelled) setQuote(q);
       } catch (e) {
@@ -59,7 +61,7 @@ export function useJupiterQuote(
       cancelled = true;
       window.clearTimeout(t);
     };
-  }, [enabled, inputMint, outputMint, amountKey, slippageBps]);
+  }, [enabled, inputMint, outputMint, amountKey, slippageBps, maxAccounts]);
 
   return { quote, loading, error };
 }

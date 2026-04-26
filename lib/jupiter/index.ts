@@ -10,6 +10,20 @@ export const SOL_MINT = new PublicKey(
   "So11111111111111111111111111111111111111112",
 );
 
+export type JupiterRoutePlan = {
+  swapInfo: {
+    ammKey: string;
+    label: string;
+    inputMint: string;
+    outputMint: string;
+    inAmount: string;
+    outAmount: string;
+    feeAmount: string;
+    feeMint: string;
+  };
+  percent: number;
+};
+
 export type JupiterQuote = {
   inputMint: string;
   inAmount: string;
@@ -24,10 +38,19 @@ export type JupiterQuote = {
   swapMode: "ExactIn" | "ExactOut";
   slippageBps: number;
   priceImpactPct: string;
-  routePlan: unknown[];
+  routePlan: JupiterRoutePlan[];
   contextSlot?: number;
   timeTaken?: number;
 };
+
+/** Distinct DEX labels involved in this Jupiter route, joined with " + ". */
+export function jupiterDexLabel(quote: JupiterQuote): string {
+  const seen = new Set<string>();
+  for (const plan of quote.routePlan ?? []) {
+    if (plan?.swapInfo?.label) seen.add(plan.swapInfo.label);
+  }
+  return seen.size > 0 ? Array.from(seen).join(" + ") : "Jupiter";
+}
 
 export type SerializedInstruction = {
   programId: string;

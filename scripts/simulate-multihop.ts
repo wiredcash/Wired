@@ -101,7 +101,9 @@ async function main() {
   console.log(
     JSON.stringify(
       {
+        provider: plan.provider,
         route: plan.route,
+        routeSteps: plan.routeSteps,
         atomic: plan.atomic,
         txCount: plan.txs.length,
         txSizes: plan.txs.map((t) => ({ label: t.label, size: t.size })),

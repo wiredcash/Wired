@@ -36,24 +36,42 @@ import {
   fetchAddressLookupTables,
   getJupiterQuote,
   getJupiterSwapInstructions,
+  jupiterDexLabel,
   type JupiterQuote,
   type SwapInstructionsResponse,
 } from "./jupiter";
 import { WIRE_FEE_BPS, WIRE_FEE_OWNER, feeEnabled } from "./jupiter/fee";
+import { QUARKS_PER_TOKEN } from "./flipcash";
 
 export type HopRoute = "usdf-direct" | "usdc-bridge" | "jupiter-bridge";
 export type SellRoute = "to-usdf" | "to-usdc" | "to-jupiter";
+export type Provider = "curve" | "jupiter-direct";
+
+/** A single human-readable hop in the chosen swap route. */
+export type RouteStep = {
+  /** Source token symbol (USDF / USDC / SOL / currency symbol / mint short). */
+  from: string;
+  to: string;
+  /** Pool/AMM/program label, e.g. "Flipcash curve", "USDF↔USDC bridge", "Jupiter (Meteora DAMM v2)". */
+  via: string;
+};
 
 const TX_SIZE_LIMIT = 1232;
 
 /**
- * Cap on Jupiter's swap account count. Jupiter's default is 64; we cap
- * at 32 so the combined Jupiter + bridge + flipcash tx (which adds ~16
- * accounts of our own) reliably fits in Solana's 1232-byte limit. The
- * goal is "always one signature" — any route that exceeds this throws
- * instead of silently splitting into two.
+ * Account-count caps for Jupiter quotes — chosen so the resulting tx
+ * always fits in Solana's 1232-byte limit and only ever needs one
+ * signature. The two values reflect different tx compositions:
+ *
+ *   • Curve path: Jupiter is one leg, plus ~16 accounts of bridge +
+ *     flipcash + ATAs + signer. 28 accounts on Jupiter leaves headroom.
+ *
+ *   • Direct path: Jupiter is the only program. We can afford a much
+ *     larger account budget — most pools for niche tokens (e.g.,
+ *     Meteora DAMM v2) need 36–48 to find a route at all.
  */
-const JUPITER_MAX_ACCOUNTS = 28;
+const JUPITER_MAX_ACCOUNTS_CURVE_LEG = 28;
+const JUPITER_MAX_ACCOUNTS_DIRECT = 48;
 
 export type SignableStep = {
   /** Short label for UI progress: "Jupiter swap", "Bridge + buy", etc. */
@@ -63,7 +81,12 @@ export type SignableStep = {
 };
 
 export type MultiHopBuyPlan = {
+  /** Which side of the aggregator won. */
+  provider: Provider;
+  /** Curve sub-classification when provider="curve". */
   route: HopRoute;
+  /** Human-readable route hops for UI display. */
+  routeSteps: RouteStep[];
   /** True if everything fits in a single tx → atomic. */
   atomic: boolean;
   txs: SignableStep[];
@@ -71,20 +94,22 @@ export type MultiHopBuyPlan = {
   minTokensOutQuarks: bigint;
   /** Best-case currency tokens (display). */
   expectedTokensOut: number;
-  /** USDF that will hit the user's USDF ATA after the bridge (worst case). */
+  /** USDF that will hit the user's USDF ATA after the bridge (worst case). 0 for jupiter-direct. */
   worstUsdfQuarks: bigint;
   jupiterQuote: JupiterQuote | null;
 };
 
 export type MultiHopSellPlan = {
+  provider: Provider;
   route: SellRoute;
+  routeSteps: RouteStep[];
   atomic: boolean;
   txs: SignableStep[];
   /** Worst-case output (in the user's chosen output mint's smallest units). */
   minOutputQuarks: bigint;
   /** Best-case output for display. */
   expectedOutput: number;
-  /** USDF the user will have after the flipcash sell (worst case). */
+  /** USDF the user will have after the flipcash sell (worst case). 0 for jupiter-direct. */
   worstUsdfQuarks: bigint;
   jupiterQuote: JupiterQuote | null;
 };
@@ -108,9 +133,17 @@ export type MultiHopBuyInput = {
   };
 };
 
-export async function planMultiHopBuy(
+/**
+ * Curve-only buy planner — input → (Jupiter→USDC if needed) → bridge USDC→USDF
+ * if needed → flipcash buy. Always single-tx (caps Jupiter at maxAccounts).
+ *
+ * Wrapped by `planMultiHopBuy` which compares this against a pure-Jupiter
+ * route and picks whichever delivers more.
+ */
+async function planCurveBuy(
   connection: Connection,
   input: MultiHopBuyInput,
+  targetSymbol: string,
 ): Promise<MultiHopBuyPlan> {
   const route = pickBuyRoute(input.inputMint);
 
@@ -133,7 +166,7 @@ export async function planMultiHopBuy(
       slippageBps: input.slippageBps,
       restrictIntermediateTokens: true,
       platformFeeBps: fee?.bps,
-      maxAccounts: JUPITER_MAX_ACCOUNTS,
+      maxAccounts: JUPITER_MAX_ACCOUNTS_CURVE_LEG,
     });
     usdcInBest = BigInt(jupiterQuote.outAmount);
     usdcInWorst = BigInt(jupiterQuote.otherAmountThreshold);
@@ -264,7 +297,9 @@ export async function planMultiHopBuy(
 
   if (singleTx.serialize().length <= TX_SIZE_LIMIT) {
     return {
+      provider: "curve",
       route,
+      routeSteps: curveBuyRouteSteps(route, input.inputMint, targetSymbol, jupiterQuote),
       atomic: true,
       txs: [
         {
@@ -280,13 +315,126 @@ export async function planMultiHopBuy(
     };
   }
 
-  // Should be unreachable with maxAccounts capped at JUPITER_MAX_ACCOUNTS,
-  // but guard anyway. We *don't* fall back to splitting — the user wants
-  // a single signature, so this path errors instead.
   throw new Error(
     `Route is too big to fit in one transaction (${singleTx.serialize().length} bytes). ` +
       `Try a smaller amount or pay with USDF/USDC instead.`,
   );
+}
+
+/**
+ * Direct-Jupiter buy planner — single Jupiter swap input→target. Returns
+ * null if Jupiter has no route or the resulting tx overflows 1232 bytes.
+ */
+async function planJupiterDirectBuy(
+  connection: Connection,
+  input: MultiHopBuyInput,
+  targetSymbol: string,
+): Promise<MultiHopBuyPlan | null> {
+  // Skip when input mint == output mint (no-op).
+  if (input.inputMint.equals(input.target.mint)) return null;
+
+  const fee = computeFeeAccount(input.target.mint);
+  let jupiterQuote: JupiterQuote;
+  try {
+    jupiterQuote = await getJupiterQuote({
+      inputMint: input.inputMint.toBase58(),
+      outputMint: input.target.mint.toBase58(),
+      amount: input.inAmount.toString(),
+      slippageBps: input.slippageBps,
+      restrictIntermediateTokens: true,
+      platformFeeBps: fee?.bps,
+      maxAccounts: JUPITER_MAX_ACCOUNTS_DIRECT,
+    });
+  } catch (e) {
+    if (process.env.WIRE_DEBUG) console.error("[direct-buy] quote failed:", (e as Error).message);
+    return null;
+  }
+
+  let swapResp: SwapInstructionsResponse;
+  try {
+    swapResp = await getJupiterSwapInstructions({
+      quoteResponse: jupiterQuote,
+      userPublicKey: input.user.toBase58(),
+      wrapAndUnwrapSol: input.inputMint.equals(SOL_MINT),
+      // Some "simple AMMs" (Meteora DAMM v2 etc.) reject shared accounts.
+      // Direct Jupiter routes don't need them anyway — leave false.
+      useSharedAccounts: false,
+      feeAccount: fee?.ata.toBase58(),
+    });
+  } catch (e) {
+    if (process.env.WIRE_DEBUG) console.error("[direct-buy] swap-ix failed:", (e as Error).message);
+    return null;
+  }
+  const ixs = unpackJupiter(swapResp);
+  const alts = await fetchAddressLookupTables(
+    connection,
+    swapResp.addressLookupTableAddresses,
+  );
+
+  const targetAta = getAssociatedTokenAddressSync(
+    input.target.mint,
+    input.user,
+  );
+  const ataPairs: Array<readonly [PublicKey, PublicKey]> = [
+    [targetAta, input.target.mint],
+  ];
+  if (fee) ataPairs.push([fee.ata, input.target.mint]);
+  const setupAtas = await buildAtaSetups(connection, input.user, ataPairs);
+
+  const { blockhash } = await connection.getLatestBlockhash("confirmed");
+  const ixsList: TransactionInstruction[] = [
+    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50_000 }),
+    ComputeBudgetProgram.setComputeUnitLimit({ units: 600_000 }),
+    ...ixs.setup,
+    ...setupAtas,
+    ixs.swap,
+    ...(ixs.cleanup ? [ixs.cleanup] : []),
+  ];
+  const tx = buildV0Tx(ixsList, input.user, blockhash, alts);
+  const size = tx.serialize().length;
+  if (size > TX_SIZE_LIMIT) return null;
+
+  // expectedTokensOut in display units (10 decimals).
+  const expectedTokensOut =
+    Number(jupiterQuote.outAmount) / Number(QUARKS_PER_TOKEN);
+  const minTokensOutQuarks = BigInt(jupiterQuote.otherAmountThreshold);
+
+  return {
+    provider: "jupiter-direct",
+    route: "usdf-direct", // unused for jupiter-direct; just satisfies the type
+    routeSteps: [
+      {
+        from: symbolOfMint(input.inputMint),
+        to: targetSymbol,
+        via: `Jupiter · ${jupiterDexLabel(jupiterQuote)}`,
+      },
+    ],
+    atomic: true,
+    txs: [{ label: "Direct swap", tx, size }],
+    minTokensOutQuarks,
+    expectedTokensOut,
+    worstUsdfQuarks: 0n,
+    jupiterQuote,
+  };
+}
+
+/**
+ * Aggregator: race the curve path and the direct-Jupiter path, return the
+ * one that delivers more target tokens. Single-tx and atomic regardless.
+ */
+export async function planMultiHopBuy(
+  connection: Connection,
+  input: MultiHopBuyInput,
+  targetSymbol = "TOKEN",
+): Promise<MultiHopBuyPlan> {
+  const [curvePlan, jupiterPlan] = await Promise.all([
+    planCurveBuy(connection, input, targetSymbol),
+    planJupiterDirectBuy(connection, input, targetSymbol).catch(() => null),
+  ]);
+  if (jupiterPlan && jupiterPlan.expectedTokensOut > curvePlan.expectedTokensOut) {
+    return jupiterPlan;
+  }
+  return curvePlan;
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -312,9 +460,14 @@ export type MultiHopSellInput = {
   };
 };
 
-export async function planMultiHopSell(
+/**
+ * Curve-only sell planner — flipcash sell → bridge USDF→USDC if needed →
+ * Jupiter USDC→output if needed. Always single-tx.
+ */
+async function planCurveSell(
   connection: Connection,
   input: MultiHopSellInput,
+  sourceSymbol: string,
 ): Promise<MultiHopSellPlan> {
   const route: SellRoute = input.outputMint.equals(USDF_MINT)
     ? "to-usdf"
@@ -367,7 +520,7 @@ export async function planMultiHopSell(
       slippageBps: input.slippageBps,
       restrictIntermediateTokens: true,
       platformFeeBps: fee?.bps,
-      maxAccounts: JUPITER_MAX_ACCOUNTS,
+      maxAccounts: JUPITER_MAX_ACCOUNTS_CURVE_LEG,
     });
     jupiterSwap = await getJupiterSwapInstructions({
       quoteResponse: jupiterQuote,
@@ -464,7 +617,14 @@ export async function planMultiHopSell(
 
   if (singleTx.serialize().length <= TX_SIZE_LIMIT) {
     return {
+      provider: "curve",
       route,
+      routeSteps: curveSellRouteSteps(
+        route,
+        sourceSymbol,
+        input.outputMint,
+        jupiterQuote,
+      ),
       atomic: true,
       txs: [
         {
@@ -485,12 +645,123 @@ export async function planMultiHopSell(
     };
   }
 
-  // Same single-tx-only contract as the buy path: throw rather than
-  // splitting if the route can't fit, so the user only ever signs once.
   throw new Error(
     `Route is too big to fit in one transaction (${singleTx.serialize().length} bytes). ` +
       `Try a smaller amount or sell to USDF/USDC instead.`,
   );
+}
+
+/**
+ * Direct-Jupiter sell planner — single Jupiter swap source→output. Returns
+ * null if Jupiter has no route or the resulting tx overflows 1232 bytes.
+ */
+async function planJupiterDirectSell(
+  connection: Connection,
+  input: MultiHopSellInput,
+  sourceSymbol: string,
+): Promise<MultiHopSellPlan | null> {
+  if (input.sourceMint.equals(input.outputMint)) return null;
+
+  const fee = computeFeeAccount(input.outputMint);
+  let jupiterQuote: JupiterQuote;
+  try {
+    jupiterQuote = await getJupiterQuote({
+      inputMint: input.sourceMint.toBase58(),
+      outputMint: input.outputMint.toBase58(),
+      amount: input.inAmount.toString(),
+      slippageBps: input.slippageBps,
+      restrictIntermediateTokens: true,
+      platformFeeBps: fee?.bps,
+      maxAccounts: JUPITER_MAX_ACCOUNTS_DIRECT,
+    });
+  } catch {
+    return null;
+  }
+
+  let swapResp: SwapInstructionsResponse;
+  try {
+    swapResp = await getJupiterSwapInstructions({
+      quoteResponse: jupiterQuote,
+      userPublicKey: input.user.toBase58(),
+      wrapAndUnwrapSol: input.outputMint.equals(SOL_MINT),
+      useSharedAccounts: false,
+      feeAccount: fee?.ata.toBase58(),
+    });
+  } catch (e) {
+    if (process.env.WIRE_DEBUG)
+      console.error("[direct-sell] swap-ix failed:", (e as Error).message);
+    return null;
+  }
+  const ixs = unpackJupiter(swapResp);
+  const alts = await fetchAddressLookupTables(
+    connection,
+    swapResp.addressLookupTableAddresses,
+  );
+
+  const sourceAta = getAssociatedTokenAddressSync(
+    input.sourceMint,
+    input.user,
+  );
+  const outputAta = getAssociatedTokenAddressSync(
+    input.outputMint,
+    input.user,
+  );
+  const ataPairs: Array<readonly [PublicKey, PublicKey]> = [
+    [sourceAta, input.sourceMint],
+    [outputAta, input.outputMint],
+  ];
+  if (fee) ataPairs.push([fee.ata, input.outputMint]);
+  const setupAtas = await buildAtaSetups(connection, input.user, ataPairs);
+
+  const { blockhash } = await connection.getLatestBlockhash("confirmed");
+  const ixsList: TransactionInstruction[] = [
+    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50_000 }),
+    ComputeBudgetProgram.setComputeUnitLimit({ units: 600_000 }),
+    ...ixs.setup,
+    ...setupAtas,
+    ixs.swap,
+    ...(ixs.cleanup ? [ixs.cleanup] : []),
+  ];
+  const tx = buildV0Tx(ixsList, input.user, blockhash, alts);
+  const size = tx.serialize().length;
+  if (size > TX_SIZE_LIMIT) return null;
+
+  return {
+    provider: "jupiter-direct",
+    route: "to-usdf",
+    routeSteps: [
+      {
+        from: sourceSymbol,
+        to: symbolOfMint(input.outputMint),
+        via: `Jupiter · ${jupiterDexLabel(jupiterQuote)}`,
+      },
+    ],
+    atomic: true,
+    txs: [{ label: "Direct swap", tx, size }],
+    minOutputQuarks: BigInt(jupiterQuote.otherAmountThreshold),
+    expectedOutput: Number(jupiterQuote.outAmount),
+    worstUsdfQuarks: 0n,
+    jupiterQuote,
+  };
+}
+
+/**
+ * Aggregator: race the curve sell path and the direct-Jupiter sell, return
+ * whichever delivers more output. Single-tx and atomic regardless.
+ */
+export async function planMultiHopSell(
+  connection: Connection,
+  input: MultiHopSellInput,
+  sourceSymbol = "TOKEN",
+): Promise<MultiHopSellPlan> {
+  const [curvePlan, jupiterPlan] = await Promise.all([
+    planCurveSell(connection, input, sourceSymbol),
+    planJupiterDirectSell(connection, input, sourceSymbol).catch(() => null),
+  ]);
+  if (jupiterPlan && jupiterPlan.expectedOutput > curvePlan.expectedOutput) {
+    return jupiterPlan;
+  }
+  return curvePlan;
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -509,6 +780,75 @@ function computeFeeAccount(
   if (!feeEnabled() || !WIRE_FEE_OWNER) return null;
   const ata = getAssociatedTokenAddressSync(outputMint, WIRE_FEE_OWNER);
   return { ata, bps: WIRE_FEE_BPS };
+}
+
+/** Resolve a known mint to its symbol, or fall back to a short mint hash. */
+function symbolOfMint(mint: PublicKey, fallback?: string): string {
+  if (mint.equals(USDF_MINT)) return "USDF";
+  if (mint.equals(USDC_MINT)) return "USDC";
+  if (mint.equals(SOL_MINT)) return "SOL";
+  return fallback ?? mint.toBase58().slice(0, 4);
+}
+
+const BRIDGE_VIA = "USDF/USDC bridge · 1:1";
+const FLIPCASH_BUY_VIA = "Flipcash curve";
+const FLIPCASH_SELL_VIA = "Flipcash curve";
+
+function curveBuyRouteSteps(
+  route: HopRoute,
+  inputMint: PublicKey,
+  targetSymbol: string,
+  jupiterQuote: JupiterQuote | null,
+): RouteStep[] {
+  if (route === "usdf-direct") {
+    return [{ from: "USDF", to: targetSymbol, via: FLIPCASH_BUY_VIA }];
+  }
+  if (route === "usdc-bridge") {
+    return [
+      { from: "USDC", to: "USDF", via: BRIDGE_VIA },
+      { from: "USDF", to: targetSymbol, via: FLIPCASH_BUY_VIA },
+    ];
+  }
+  // jupiter-bridge
+  return [
+    {
+      from: symbolOfMint(inputMint),
+      to: "USDC",
+      via: jupiterQuote
+        ? `Jupiter · ${jupiterDexLabel(jupiterQuote)}`
+        : "Jupiter",
+    },
+    { from: "USDC", to: "USDF", via: BRIDGE_VIA },
+    { from: "USDF", to: targetSymbol, via: FLIPCASH_BUY_VIA },
+  ];
+}
+
+function curveSellRouteSteps(
+  route: SellRoute,
+  sourceSymbol: string,
+  outputMint: PublicKey,
+  jupiterQuote: JupiterQuote | null,
+): RouteStep[] {
+  if (route === "to-usdf") {
+    return [{ from: sourceSymbol, to: "USDF", via: FLIPCASH_SELL_VIA }];
+  }
+  if (route === "to-usdc") {
+    return [
+      { from: sourceSymbol, to: "USDF", via: FLIPCASH_SELL_VIA },
+      { from: "USDF", to: "USDC", via: BRIDGE_VIA },
+    ];
+  }
+  return [
+    { from: sourceSymbol, to: "USDF", via: FLIPCASH_SELL_VIA },
+    { from: "USDF", to: "USDC", via: BRIDGE_VIA },
+    {
+      from: "USDC",
+      to: symbolOfMint(outputMint),
+      via: jupiterQuote
+        ? `Jupiter · ${jupiterDexLabel(jupiterQuote)}`
+        : "Jupiter",
+    },
+  ];
 }
 
 function pickBuyRoute(inputMint: PublicKey): HopRoute {

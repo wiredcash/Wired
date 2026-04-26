@@ -32,6 +32,15 @@ import { CurrencyIcon } from "./CurrencyIcon";
 import { TokenIcon } from "./TokenIcon";
 import { InputTokenChip } from "./InputTokenChip";
 import { SwapSuccessModal, type SwapSummary } from "./SwapSuccessModal";
+import { RouteSummary } from "./RouteSummary";
+import type { Provider, RouteStep } from "@/lib/multi-hop";
+import { jupiterDexLabel } from "@/lib/jupiter";
+
+/** Mirrors lib/multi-hop's JUPITER_MAX_ACCOUNTS_DIRECT — kept in sync so
+ *  the live UI quote and the eventual planner pick the same routes. */
+const LIVE_DIRECT_MAX_ACCOUNTS = 48;
+/** Mirrors JUPITER_MAX_ACCOUNTS_CURVE_LEG. */
+const LIVE_CURVE_LEG_MAX_ACCOUNTS = 28;
 
 type Direction = "buy" | "sell";
 type SideTokenKey = "USDF" | "USDC" | "SOL";
@@ -119,8 +128,11 @@ export function Swap() {
     [input, sourceDecimals],
   );
 
-  // ─── Live Jupiter quote ─────────────────────────────────────────────
-  // Buy mode: input → USDC.   Sell mode: USDC → output.
+  // ─── Live Jupiter quotes ────────────────────────────────────────────
+  // Two quotes per direction so the aggregator can compare paths live.
+  // Buy mode:
+  //   • buyJup     = input → USDC  (used by the curve path's first leg)
+  //   • directBuy  = input → target (the direct-Jupiter alternative)
   const buyJupiterEnabled = isBuy && inputToken === "SOL";
   const buyJup = useJupiterQuote(
     buyJupiterEnabled,
@@ -128,6 +140,17 @@ export function Swap() {
     USDC_MINT.toBase58(),
     inputQuarks,
     slippageBps,
+    LIVE_CURVE_LEG_MAX_ACCOUNTS,
+  );
+  const directBuyEnabled =
+    isBuy && !!selected && inputToken !== "USDF"; // USDF→target rarely on Jupiter
+  const directBuy = useJupiterQuote(
+    directBuyEnabled,
+    sideInfo.mint.toBase58(),
+    selected?.mint ?? "",
+    inputQuarks,
+    slippageBps,
+    LIVE_DIRECT_MAX_ACCOUNTS,
   );
 
   // For sell side, Jupiter input is USDC = worst-case USDF after sell.
@@ -165,6 +188,18 @@ export function Swap() {
     sideInfo.mint.toBase58(),
     sellUsdfWorstQuarks,
     slippageBps,
+    LIVE_CURVE_LEG_MAX_ACCOUNTS,
+  );
+  // Direct sell: source token (currency) → user's chosen output. Skip when
+  // output is the same as source (no-op) or the currency is unselected.
+  const directSellEnabled = !isBuy && !!selected;
+  const directSell = useJupiterQuote(
+    directSellEnabled,
+    selected?.mint ?? "",
+    sideInfo.mint.toBase58(),
+    inputQuarks,
+    slippageBps,
+    LIVE_DIRECT_MAX_ACCOUNTS,
   );
 
   // ─── Display quote ──────────────────────────────────────────────────
@@ -220,24 +255,181 @@ export function Swap() {
     };
   }, [isBuy, sellQuoteRaw, outputToken, sellJup.quote, sideInfo.decimals]);
 
-  const expectedOutDisplay = useMemo(() => {
-    if (isBuy) {
-      if (inputToken === "SOL" && buyJup.loading && !buyQuote) return "…";
-      return buyQuote ? fmtCompactNumber(buyQuote.expectedTokensOut) : "0";
+  // ─── Aggregated route — pick whichever path delivers more output ────
+  // Mirrors lib/multi-hop's planMultiHopBuy/Sell logic so the live UI
+  // matches what the planner ultimately submits.
+  type Aggregated = {
+    provider: Provider;
+    expectedOut: number; // display units
+    steps: RouteStep[];
+    alt: { providerLabel: string; deltaPct: number } | null;
+  };
+
+  const aggregatedBuy = useMemo<Aggregated | null>(() => {
+    if (!isBuy || !selected || !buyQuote) return null;
+    const curveOut = buyQuote.expectedTokensOut;
+    const directOut = directBuy.quote
+      ? Number(directBuy.quote.outAmount) / 10 ** TOKEN_DECIMALS
+      : null;
+
+    // Build the curve route's steps based on inputToken.
+    const curveSteps: RouteStep[] = [];
+    if (inputToken === "USDF") {
+      curveSteps.push({
+        from: "USDF",
+        to: selected.symbol,
+        via: "Flipcash curve",
+      });
+    } else if (inputToken === "USDC") {
+      curveSteps.push({
+        from: "USDC",
+        to: "USDF",
+        via: "USDF/USDC bridge · 1:1",
+      });
+      curveSteps.push({
+        from: "USDF",
+        to: selected.symbol,
+        via: "Flipcash curve",
+      });
+    } else {
+      // SOL — Jupiter handles the SOL→USDC leg
+      curveSteps.push({
+        from: inputToken,
+        to: "USDC",
+        via: buyJup.quote
+          ? `Jupiter · ${jupiterDexLabel(buyJup.quote)}`
+          : "Jupiter",
+      });
+      curveSteps.push({
+        from: "USDC",
+        to: "USDF",
+        via: "USDF/USDC bridge · 1:1",
+      });
+      curveSteps.push({
+        from: "USDF",
+        to: selected.symbol,
+        via: "Flipcash curve",
+      });
     }
-    if (outputToken === "SOL" && sellJup.loading && !sellDisplayAmount) {
-      return "…";
+
+    if (directOut !== null && directOut > curveOut) {
+      const deltaPct = curveOut > 0 ? (directOut / curveOut - 1) * 100 : 0;
+      return {
+        provider: "jupiter-direct",
+        expectedOut: directOut,
+        steps: [
+          {
+            from: inputToken,
+            to: selected.symbol,
+            via: `Jupiter · ${jupiterDexLabel(directBuy.quote!)}`,
+          },
+        ],
+        alt: { providerLabel: "Flipcash curve", deltaPct },
+      };
     }
-    return sellDisplayAmount ? sellDisplayAmount.formatted : "0";
+    const deltaPct =
+      directOut !== null && directOut > 0
+        ? (curveOut / directOut - 1) * 100
+        : 0;
+    return {
+      provider: "curve",
+      expectedOut: curveOut,
+      steps: curveSteps,
+      alt: directOut !== null ? { providerLabel: "Jupiter", deltaPct } : null,
+    };
+  }, [isBuy, selected, buyQuote, directBuy.quote, inputToken, buyJup.quote]);
+
+  const aggregatedSell = useMemo<Aggregated | null>(() => {
+    if (isBuy || !selected || !sellQuoteRaw) return null;
+
+    // Curve path's expected output in user's chosen output mint's display
+    // units.
+    let curveOut: number;
+    if (outputToken === "USDF" || outputToken === "USDC") {
+      // 1:1 bridge USDF↔USDC, both 6 decimals → expected USDF == USDC
+      curveOut = sellQuoteRaw.expectedUsdfOut;
+    } else {
+      // SOL: relies on Jupiter's USDC→SOL quote at sellUsdfWorstQuarks
+      curveOut = sellJup.quote
+        ? Number(sellJup.quote.outAmount) / 10 ** sideInfo.decimals
+        : 0;
+    }
+
+    const directOut = directSell.quote
+      ? Number(directSell.quote.outAmount) / 10 ** sideInfo.decimals
+      : null;
+
+    // Build curve route steps.
+    const curveSteps: RouteStep[] = [
+      { from: selected.symbol, to: "USDF", via: "Flipcash curve" },
+    ];
+    if (outputToken === "USDC") {
+      curveSteps.push({
+        from: "USDF",
+        to: "USDC",
+        via: "USDF/USDC bridge · 1:1",
+      });
+    } else if (outputToken === "SOL") {
+      curveSteps.push({
+        from: "USDF",
+        to: "USDC",
+        via: "USDF/USDC bridge · 1:1",
+      });
+      curveSteps.push({
+        from: "USDC",
+        to: outputToken,
+        via: sellJup.quote
+          ? `Jupiter · ${jupiterDexLabel(sellJup.quote)}`
+          : "Jupiter",
+      });
+    }
+
+    if (directOut !== null && directOut > curveOut) {
+      const deltaPct = curveOut > 0 ? (directOut / curveOut - 1) * 100 : 0;
+      return {
+        provider: "jupiter-direct",
+        expectedOut: directOut,
+        steps: [
+          {
+            from: selected.symbol,
+            to: outputToken,
+            via: `Jupiter · ${jupiterDexLabel(directSell.quote!)}`,
+          },
+        ],
+        alt: { providerLabel: "Flipcash curve", deltaPct },
+      };
+    }
+    const deltaPct =
+      directOut !== null && directOut > 0
+        ? (curveOut / directOut - 1) * 100
+        : 0;
+    return {
+      provider: "curve",
+      expectedOut: curveOut,
+      steps: curveSteps,
+      alt: directOut !== null ? { providerLabel: "Jupiter", deltaPct } : null,
+    };
   }, [
     isBuy,
-    inputToken,
+    selected,
+    sellQuoteRaw,
+    directSell.quote,
+    sellJup.quote,
     outputToken,
-    buyJup.loading,
-    buyQuote,
-    sellJup.loading,
-    sellDisplayAmount,
+    sideInfo.decimals,
   ]);
+
+  const aggregated = isBuy ? aggregatedBuy : aggregatedSell;
+
+  const aggregatorLoading = isBuy
+    ? directBuy.loading || (inputToken === "SOL" && buyJup.loading)
+    : directSell.loading || (outputToken === "SOL" && sellJup.loading);
+
+  const expectedOutDisplay = useMemo(() => {
+    if (aggregated) return fmtCompactNumber(aggregated.expectedOut);
+    if (aggregatorLoading) return "…";
+    return "0";
+  }, [aggregated, aggregatorLoading]);
 
   const priceLabel = useMemo(() => {
     if (!selected) return "—";
@@ -393,37 +585,45 @@ export function Swap() {
     try {
       const txs: SignableStep[] = isBuy
         ? (
-            await planMultiHopBuy(connection, {
-              user: publicKey,
-              inputMint: sideInfo.mint,
-              inAmount: inputQuarks,
-              slippageBps,
-              target: {
-                mint: new PublicKey(selected.mint),
-                pool: new PublicKey(selected.pool),
-                vaultA: new PublicKey(selected.vaultA),
-                vaultB: new PublicKey(selected.vaultB),
-                reserveTokenQuarks: BigInt(selected.reserveTokenQuarks ?? "0"),
-                reserveUsdfQuarks: BigInt(selected.reserveUsdfQuarks ?? "0"),
+            await planMultiHopBuy(
+              connection,
+              {
+                user: publicKey,
+                inputMint: sideInfo.mint,
+                inAmount: inputQuarks,
+                slippageBps,
+                target: {
+                  mint: new PublicKey(selected.mint),
+                  pool: new PublicKey(selected.pool),
+                  vaultA: new PublicKey(selected.vaultA),
+                  vaultB: new PublicKey(selected.vaultB),
+                  reserveTokenQuarks: BigInt(selected.reserveTokenQuarks ?? "0"),
+                  reserveUsdfQuarks: BigInt(selected.reserveUsdfQuarks ?? "0"),
+                },
               },
-            })
+              selected.symbol,
+            )
           ).txs
         : (
-            await planMultiHopSell(connection, {
-              user: publicKey,
-              sourceMint: new PublicKey(selected.mint),
-              inAmount: inputQuarks,
-              outputMint: sideInfo.mint,
-              slippageBps,
-              source: {
-                pool: new PublicKey(selected.pool),
-                vaultA: new PublicKey(selected.vaultA),
-                vaultB: new PublicKey(selected.vaultB),
-                reserveTokenQuarks: BigInt(selected.reserveTokenQuarks ?? "0"),
-                reserveUsdfQuarks: BigInt(selected.reserveUsdfQuarks ?? "0"),
-                sellFeeBps: selected.sellFeeBps ?? 100,
+            await planMultiHopSell(
+              connection,
+              {
+                user: publicKey,
+                sourceMint: new PublicKey(selected.mint),
+                inAmount: inputQuarks,
+                outputMint: sideInfo.mint,
+                slippageBps,
+                source: {
+                  pool: new PublicKey(selected.pool),
+                  vaultA: new PublicKey(selected.vaultA),
+                  vaultB: new PublicKey(selected.vaultB),
+                  reserveTokenQuarks: BigInt(selected.reserveTokenQuarks ?? "0"),
+                  reserveUsdfQuarks: BigInt(selected.reserveUsdfQuarks ?? "0"),
+                  sellFeeBps: selected.sellFeeBps ?? 100,
+                },
               },
-            })
+              selected.symbol,
+            )
           ).txs;
 
       const sigs: string[] = [];
@@ -657,6 +857,13 @@ export function Swap() {
           {status.message}
         </p>
       )}
+
+      <RouteSummary
+        loading={aggregatorLoading && !aggregated}
+        steps={aggregated?.steps ?? null}
+        provider={aggregated?.provider ?? null}
+        alt={aggregated?.alt ?? null}
+      />
 
       <TokenPicker
         open={pickerOpen}
