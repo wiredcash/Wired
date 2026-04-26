@@ -12,7 +12,7 @@ export default function Page() {
         <div className="relative w-[110px] h-[110px] sm:w-[128px] sm:h-[128px] rounded-2xl overflow-hidden bg-black ring-1 ring-white/[0.08]">
           <Image
             src="/logo.png"
-            alt="Wire"
+            alt="Wired"
             fill
             priority
             sizes="128px"
@@ -51,9 +51,9 @@ function Nav() {
       <div className="max-w-6xl mx-auto px-4 h-14 flex items-center justify-between">
         <Link href="/" className="flex items-center gap-2.5 group">
           <div className="w-7 h-7 rounded-md overflow-hidden bg-black ring-1 ring-white/10">
-            <Image src="/logo.png" alt="Wire" width={28} height={28} />
+            <Image src="/logo.png" alt="Wired" width={28} height={28} />
           </div>
-          <span className="font-semibold tracking-tight">Wire</span>
+          <span className="font-semibold tracking-tight">Wired</span>
         </Link>
         <nav className="flex items-center gap-1 text-[13px] text-white/55">
           <IconLink
@@ -112,7 +112,7 @@ function About() {
           About
         </div>
         <p className="text-[14.5px] sm:text-[15px] leading-relaxed text-white/65">
-          Wire is an open-source, non-custodial interface for Flipcash. It
+          Wired is an open-source, non-custodial interface for Flipcash. It
           talks directly to two audited Solana programs:{" "}
           <span className="text-white/85">usdf-swap</span> for 1:1 USDF↔USDC
           bridging, and <span className="text-white/85">flipcash</span> for

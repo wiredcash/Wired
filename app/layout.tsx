@@ -11,21 +11,21 @@ const inter = Inter({
 
 export const metadata: Metadata = {
   metadataBase: new URL("https://wired.cash"),
-  title: "Wire — USDF ↔ USDC Bridge",
+  title: "Wired — USDF ↔ USDC Bridge",
   description:
     "Open-source UI for the Flipcash USDF/USDC swap pool. 1:1 swaps, no spread.",
   openGraph: {
-    title: "Wire — USDF ↔ USDC Bridge",
+    title: "Wired — USDF ↔ USDC Bridge",
     description:
       "Open-source UI for the Flipcash USDF/USDC swap pool. 1:1 swaps, no spread.",
     url: "https://wired.cash",
-    siteName: "Wire",
+    siteName: "Wired",
     images: ["/logo.png"],
     type: "website",
   },
   twitter: {
     card: "summary",
-    title: "Wire — USDF ↔ USDC Bridge",
+    title: "Wired — USDF ↔ USDC Bridge",
     description:
       "Open-source UI for the Flipcash USDF/USDC swap pool. 1:1 swaps, no spread.",
     site: "@wired_cash",
