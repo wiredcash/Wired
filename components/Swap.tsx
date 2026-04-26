@@ -25,6 +25,7 @@ import { useTokenBalance } from "./useTokenBalance";
 import { useSolBalance } from "./useSolBalance";
 import { useCurrencies } from "./useCurrencies";
 import { useJupiterQuote } from "./useJupiterQuote";
+import { usePoolState } from "./usePoolState";
 import { TokenPicker } from "./TokenPicker";
 import { CurrencyIcon } from "./CurrencyIcon";
 import { TokenIcon } from "./TokenIcon";
@@ -78,6 +79,7 @@ export function Swap() {
   const usdf = useTokenBalance(publicKey, USDF_BASE_MINT, refresh);
   const usdc = useTokenBalance(publicKey, USDC_MINT, refresh);
   const sol = useSolBalance(publicKey, refresh);
+  const bridge = usePoolState(refresh);
   const targetMint = useMemo(
     () => (selected ? new PublicKey(selected.mint) : null),
     [selected],
@@ -248,6 +250,7 @@ export function Swap() {
 
   // ─── Validation ─────────────────────────────────────────────────────
   const validation = useMemo<{ ok: boolean; reason?: string }>(() => {
+    void bridge.data; // referenced inside conditionals below
     if (!connected || !publicKey)
       return { ok: false, reason: "Connect wallet" };
     if (!selected) return { ok: false, reason: "Select a currency" };
@@ -270,9 +273,35 @@ export function Swap() {
         return { ok: false, reason: "Pool has no USDF reserve" };
       if (outputToken === "SOL" && sellJup.loading && !sellJup.quote)
         return { ok: false, reason: "Fetching route…" };
+      // Selling to USDC or SOL goes through the bridge USDF → USDC. The
+      // bridge can only fill that direction if its USDC vault is funded.
+      if (outputToken !== "USDF" && bridge.data) {
+        const need = sellUsdfWorstQuarks ?? 0n;
+        if (need > bridge.data.otherVaultBalance) {
+          return {
+            ok: false,
+            reason: "Bridge out of USDC — try selling to USDF",
+          };
+        }
+      }
     }
     if (isBuy && inputToken === "SOL" && buyJup.loading && !buyJup.quote)
       return { ok: false, reason: "Fetching route…" };
+    // Symmetric guard for buy: USDC and SOL inputs both use the bridge to
+    // convert USDC into USDF, so the USDF vault must hold enough.
+    if (isBuy && inputToken !== "USDF" && bridge.data && inputQuarks) {
+      const need = inputToken === "USDC" ? inputQuarks : 0n;
+      // For SOL the bridge consumes the Jupiter output (USDC). Use the
+      // live Jupiter worst-case if we have it; otherwise let the on-chain
+      // simulation surface any shortfall instead of guessing.
+      const finalNeed =
+        inputToken === "SOL" && buyJup.quote
+          ? BigInt(buyJup.quote.otherAmountThreshold)
+          : need;
+      if (finalNeed > 0n && finalNeed > bridge.data.usdfVaultBalance) {
+        return { ok: false, reason: "Bridge out of USDF" };
+      }
+    }
     return { ok: true };
   }, [
     connected,
@@ -290,6 +319,8 @@ export function Swap() {
     buyJup.quote,
     sellJup.loading,
     sellJup.quote,
+    bridge.data,
+    sellUsdfWorstQuarks,
   ]);
 
   // ─── Actions ────────────────────────────────────────────────────────
@@ -311,16 +342,18 @@ export function Swap() {
     setInput(fmtQuarks(sourceBalance, sourceDecimals, sourceDecimals));
   }
 
-  async function sendStep(
-    step: SignableStep,
-  ): Promise<string> {
-    const sig = await sendTransaction(step.tx, connection);
-    const latest = await connection.getLatestBlockhash();
-    await connection.confirmTransaction(
-      { signature: sig, ...latest },
-      "confirmed",
-    );
-    return sig;
+  async function sendStep(step: SignableStep): Promise<string> {
+    try {
+      const sig = await sendTransaction(step.tx, connection);
+      const latest = await connection.getLatestBlockhash();
+      await connection.confirmTransaction(
+        { signature: sig, ...latest },
+        "confirmed",
+      );
+      return sig;
+    } catch (err) {
+      throw enrichTxError(err, step.label);
+    }
   }
 
   async function handleSubmit() {
@@ -602,6 +635,31 @@ export function Swap() {
       />
     </div>
   );
+}
+
+/**
+ * The wallet adapter wraps every send error in WalletSendTransactionError,
+ * which hides the actual reason behind a generic message. Underneath there's
+ * usually a SendTransactionError from web3.js with `.logs` and a more useful
+ * `.message`. Pull whatever we can find and produce a single readable line.
+ */
+function enrichTxError(err: unknown, label: string): Error {
+  const e = err as {
+    message?: string;
+    error?: { message?: string; logs?: string[] };
+    logs?: string[];
+  };
+  const inner = e?.error?.message ?? "";
+  const logs = e?.error?.logs ?? e?.logs ?? [];
+  // Find the first program-emitted error log line.
+  const programErr = logs.find((l) =>
+    /(Program log: |custom program error|failed: )/i.test(l),
+  );
+  const head = inner || e?.message || "transaction failed";
+  const detail = programErr
+    ? ` · ${programErr.replace(/^Program log:\s*/, "")}`
+    : "";
+  return new Error(`${label}: ${head}${detail}`);
 }
 
 function combinedImpact(
