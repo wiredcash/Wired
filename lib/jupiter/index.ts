@@ -58,6 +58,13 @@ export type QuoteOptions = {
    * leaner instruction set that's more likely to fit in a single tx.
    */
   restrictIntermediateTokens?: boolean;
+  /**
+   * Integrator fee in basis points, deducted from the OUTPUT mint and
+   * sent to the `feeAccount` passed to swap-instructions. Both must be
+   * provided together — Jupiter rejects a quote with platformFeeBps but
+   * no feeAccount (or vice versa).
+   */
+  platformFeeBps?: number;
 };
 
 /**
@@ -81,6 +88,8 @@ export async function getJupiterQuote(
   if (opts.onlyDirectRoutes) search.set("onlyDirectRoutes", "true");
   if (opts.restrictIntermediateTokens)
     search.set("restrictIntermediateTokens", "true");
+  if (opts.platformFeeBps && opts.platformFeeBps > 0)
+    search.set("platformFeeBps", opts.platformFeeBps.toString());
 
   const r = await fetch(
     `${proxyBase()}/api/jupiter/quote?${search.toString()}`,
@@ -106,6 +115,12 @@ export type SwapInstructionsBody = {
    * level so the multi-hop tx fee is right-sized for all three legs.
    */
   skipUserAccountsRpcCalls?: boolean;
+  /**
+   * Token account that receives the platform fee. Must be an ATA for the
+   * Jupiter leg's OUTPUT mint, owned by the integrator. Required iff
+   * the matching quote was taken with `platformFeeBps`.
+   */
+  feeAccount?: string;
 };
 
 export async function getJupiterSwapInstructions(

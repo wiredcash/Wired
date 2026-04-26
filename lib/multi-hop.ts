@@ -39,6 +39,7 @@ import {
   type JupiterQuote,
   type SwapInstructionsResponse,
 } from "./jupiter";
+import { WIRE_FEE_BPS, WIRE_FEE_OWNER, feeEnabled } from "./jupiter/fee";
 
 export type HopRoute = "usdf-direct" | "usdc-bridge" | "jupiter-bridge";
 export type SellRoute = "to-usdf" | "to-usdc" | "to-jupiter";
@@ -113,12 +114,16 @@ export async function planMultiHopBuy(
   let usdcInWorst: bigint;
 
   if (route === "jupiter-bridge") {
+    // Jupiter fee — output mint of the Jupiter leg is USDC for buy.
+    const fee = computeFeeAccount(USDC_MINT);
+
     jupiterQuote = await getJupiterQuote({
       inputMint: input.inputMint.toBase58(),
       outputMint: USDC_MINT.toBase58(),
       amount: input.inAmount.toString(),
       slippageBps: input.slippageBps,
       restrictIntermediateTokens: true,
+      platformFeeBps: fee?.bps,
     });
     usdcInBest = BigInt(jupiterQuote.outAmount);
     usdcInWorst = BigInt(jupiterQuote.otherAmountThreshold);
@@ -128,6 +133,7 @@ export async function planMultiHopBuy(
       userPublicKey: input.user.toBase58(),
       wrapAndUnwrapSol: input.inputMint.equals(SOL_MINT),
       useSharedAccounts: true,
+      feeAccount: fee?.ata.toBase58(),
     });
     jupiterIxs = unpackJupiter(jupiterSwap);
     jupiterAlts = await fetchAddressLookupTables(
@@ -181,17 +187,20 @@ export async function planMultiHopBuy(
   const usdfAta = getAssociatedTokenAddressSync(USDF_BASE_MINT, input.user);
   const usdcAta = getAssociatedTokenAddressSync(USDC_MINT, input.user);
 
-  const setupAtas = await buildAtaSetups(
-    connection,
-    input.user,
-    [
-      [targetAta, input.target.mint],
-      [usdfAta, USDF_BASE_MINT],
-      ...(route === "usdf-direct"
-        ? []
-        : ([[usdcAta, USDC_MINT]] as const)),
-    ],
-  );
+  const ataPairs: Array<readonly [PublicKey, PublicKey]> = [
+    [targetAta, input.target.mint],
+    [usdfAta, USDF_BASE_MINT],
+  ];
+  if (route !== "usdf-direct") {
+    ataPairs.push([usdcAta, USDC_MINT]);
+  }
+  // When fees are on and the Jupiter leg outputs USDC, the integrator's
+  // USDC fee ATA must exist before the swap or Jupiter rejects the tx.
+  if (route === "jupiter-bridge") {
+    const fee = computeFeeAccount(USDC_MINT);
+    if (fee) ataPairs.push([fee.ata, USDC_MINT]);
+  }
+  const setupAtas = await buildAtaSetups(connection, input.user, ataPairs);
 
   // ─── Bridge ix (USDC → USDF) ────────────────────────────────────────
   const bridgeIx =
@@ -371,18 +380,23 @@ export async function planMultiHopSell(
       throw new Error("Sell would yield 0 USDF — cannot route through Jupiter");
     }
     // Jupiter takes the worst-case USDC (= usdfWorst since 1:1) as input.
+    // Fee is taken in the OUTPUT mint (user's chosen output, e.g., wSOL).
+    const fee = computeFeeAccount(input.outputMint);
+
     jupiterQuote = await getJupiterQuote({
       inputMint: USDC_MINT.toBase58(),
       outputMint: input.outputMint.toBase58(),
       amount: usdfWorst.toString(),
       slippageBps: input.slippageBps,
       restrictIntermediateTokens: true,
+      platformFeeBps: fee?.bps,
     });
     jupiterSwap = await getJupiterSwapInstructions({
       quoteResponse: jupiterQuote,
       userPublicKey: input.user.toBase58(),
       wrapAndUnwrapSol: input.outputMint.equals(SOL_MINT),
       useSharedAccounts: true,
+      feeAccount: fee?.ata.toBase58(),
     });
     jupiterIxs = unpackJupiter(jupiterSwap);
     jupiterAlts = await fetchAddressLookupTables(
@@ -409,17 +423,17 @@ export async function planMultiHopSell(
   const usdfAta = getAssociatedTokenAddressSync(USDF_BASE_MINT, input.user);
   const usdcAta = getAssociatedTokenAddressSync(USDC_MINT, input.user);
 
-  const setupAtas = await buildAtaSetups(
-    connection,
-    input.user,
-    [
-      [sourceAta, input.sourceMint],
-      [usdfAta, USDF_BASE_MINT],
-      ...(route === "to-usdf"
-        ? []
-        : ([[usdcAta, USDC_MINT]] as const)),
-    ],
-  );
+  const sellAtaPairs: Array<readonly [PublicKey, PublicKey]> = [
+    [sourceAta, input.sourceMint],
+    [usdfAta, USDF_BASE_MINT],
+  ];
+  if (route !== "to-usdf") sellAtaPairs.push([usdcAta, USDC_MINT]);
+  // For sell→non-USDF/USDC routes, fee ATA is for the user's output mint.
+  if (route === "to-jupiter") {
+    const fee = computeFeeAccount(input.outputMint);
+    if (fee) sellAtaPairs.push([fee.ata, input.outputMint]);
+  }
+  const setupAtas = await buildAtaSetups(connection, input.user, sellAtaPairs);
 
   // ─── Build instructions ─────────────────────────────────────────────
   const sellIx = buildSellTokensIx(
@@ -536,6 +550,20 @@ export async function planMultiHopSell(
 // ─────────────────────────────────────────────────────────────────────
 //                              helpers
 // ─────────────────────────────────────────────────────────────────────
+
+/**
+ * Resolve the integrator-fee ATA for a Jupiter-leg output mint, plus the
+ * basis-points value to pass alongside in the quote. Returns null when
+ * the fee is disabled (env vars unset), in which case Jupiter calls run
+ * without `platformFeeBps`/`feeAccount`.
+ */
+function computeFeeAccount(
+  outputMint: PublicKey,
+): { ata: PublicKey; bps: number } | null {
+  if (!feeEnabled() || !WIRE_FEE_OWNER) return null;
+  const ata = getAssociatedTokenAddressSync(outputMint, WIRE_FEE_OWNER);
+  return { ata, bps: WIRE_FEE_BPS };
+}
 
 function pickBuyRoute(inputMint: PublicKey): HopRoute {
   if (inputMint.equals(USDF_MINT)) return "usdf-direct";
