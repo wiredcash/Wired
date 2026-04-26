@@ -18,6 +18,7 @@ import {
   planMultiHopSell,
   type SignableStep,
 } from "@/lib/multi-hop";
+import { confirmSignaturePolling } from "@/lib/confirm";
 import type { IndexedCurrency } from "@/lib/flipcash/index-currencies";
 import { fmtQuarks, parseInput } from "./format";
 import { fmtCompactNumber, fmtPct, fmtUsd } from "./format-numbers";
@@ -349,11 +350,14 @@ export function Swap() {
   async function sendStep(step: SignableStep): Promise<string> {
     try {
       const sig = await sendTransaction(step.tx, connection);
-      const latest = await connection.getLatestBlockhash();
-      await connection.confirmTransaction(
-        { signature: sig, ...latest },
-        "confirmed",
-      );
+      // Polling instead of confirmTransaction — Vercel Functions don't
+      // proxy WebSockets, and the WS subscription confirmTransaction opens
+      // would otherwise spew "WebSocket connection to wss://…/api/rpc" in
+      // the browser console.
+      await confirmSignaturePolling(connection, sig, {
+        desiredCommitment: "confirmed",
+        timeoutMs: 60_000,
+      });
       return sig;
     } catch (err) {
       throw enrichTxError(err, step.label);

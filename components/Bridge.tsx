@@ -17,6 +17,7 @@ import { fmtQuarks, parseInput } from "./format";
 import { usePoolState } from "./usePoolState";
 import { useTokenBalance } from "./useTokenBalance";
 import { TokenIcon } from "./TokenIcon";
+import { confirmSignaturePolling } from "@/lib/confirm";
 
 type Direction = "usdf-to-usdc" | "usdc-to-usdf";
 
@@ -131,11 +132,12 @@ export function Bridge() {
         plan.swapIx,
       );
       const sig = await sendTransaction(tx, connection);
-      const latest = await connection.getLatestBlockhash();
-      await connection.confirmTransaction(
-        { signature: sig, ...latest },
-        "confirmed",
-      );
+      // Polling-based confirmation — see lib/confirm.ts for why we don't
+      // use connection.confirmTransaction() here.
+      await confirmSignaturePolling(connection, sig, {
+        desiredCommitment: "confirmed",
+        timeoutMs: 60_000,
+      });
       setStatus({ kind: "success", signature: sig });
       setInput("");
       setRefresh((r) => r + 1);
