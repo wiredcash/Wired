@@ -8,19 +8,8 @@ export default function Page() {
     <main className="relative min-h-screen flex flex-col">
       <Nav />
 
-      <section className="relative px-4 pt-16 sm:pt-24 pb-10 flex flex-col items-center text-center">
-        <div className="relative w-[110px] h-[110px] sm:w-[128px] sm:h-[128px] rounded-2xl overflow-hidden bg-black ring-1 ring-white/[0.08]">
-          <Image
-            src="/logo.png"
-            alt="Wired"
-            fill
-            priority
-            sizes="128px"
-            className="object-cover"
-          />
-        </div>
-
-        <h1 className="mt-7 text-[44px] sm:text-[64px] font-semibold tracking-[-0.04em] leading-[1.02]">
+      <section className="relative px-4 pt-20 sm:pt-28 pb-10 flex flex-col items-center text-center">
+        <h1 className="text-[44px] sm:text-[64px] font-semibold tracking-[-0.04em] leading-[1.02]">
           The Flipcash
           <span className="block text-white/35">terminal.</span>
         </h1>
