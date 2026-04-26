@@ -21,9 +21,11 @@ Flipcash's two on-chain Solana programs:
   denominated in USDF.
 
 Plus a built-in **aggregator**: every swap also gets quoted against Jupiter,
-and the path that delivers more output wins. Today this captures ~30% better
-prices on most non-USDF inputs (e.g., USDC→JFY routes through Meteora DAMM v2
-on Jupiter rather than the curve).
+and the path that delivers more output wins. The win/loss varies by pair and
+size — Flipcash currency pools on Jupiter (e.g. Meteora DAMM v2) tend to be
+shallow, so Jupiter typically beats the curve on small swaps and the curve
+takes over once price impact climbs. Quotes are live, so the panel shows the
+chosen route as the user types.
 
 Every transaction is signed in the user's own wallet. The server holds API
 keys behind proxy routes — the browser bundle stays clean.
@@ -242,18 +244,21 @@ See [`docs/SDK.md`](./docs/SDK.md) for the full reference and
 ## Aggregator behavior
 
 For each swap, the planner races two paths in parallel and submits whichever
-delivers more output:
+delivers more output. Which path wins depends on the pair and the size:
+Flipcash currency pools on Jupiter (e.g. Meteora DAMM v2) tend to be shallow,
+so the bonding curve frequently wins above small notional sizes once
+Jupiter's price impact climbs. The aggregator picks live, every keystroke.
 
-| Input | Curve path | Direct Jupiter | Typical winner |
+| Input | Curve path | Direct Jupiter | Notes |
 | --- | --- | --- | --- |
-| USDF → currency | flipcash buy | (no Jupiter route from USDF) | curve |
-| USDC → currency | bridge → flipcash | Jupiter (e.g. Meteora DAMM v2) | **Jupiter, ~30% better** |
-| SOL → currency | Jupiter (SOL→USDC) → bridge → flipcash | Jupiter direct (SOL→target) | **Jupiter direct, ~30% better** |
-| currency → USDF | flipcash sell | (rare) | curve |
+| USDF → currency | flipcash buy | (often no Jupiter route from USDF) | curve almost always wins |
+| USDC → currency | bridge → flipcash | Jupiter (e.g. Meteora DAMM v2) | Jupiter often wins on small notionals; curve takes over above pool depth |
+| SOL → currency | Jupiter (SOL→USDC) → bridge → flipcash | Jupiter direct (SOL→target) | depends on the target's Jupiter pool depth |
+| currency → USDF | flipcash sell | (rare) | curve almost always wins |
 | currency → USDC | flipcash sell → bridge | Jupiter direct | depends on pool |
 | currency → SOL | flipcash sell → bridge → Jupiter (USDC→SOL) | Jupiter direct | depends on pool |
 
-**Splitting** (e.g., 30% Jupiter + 70% curve) is intentionally not implemented
+**Splitting** (e.g., partial Jupiter + partial curve) is intentionally not implemented
 in the off-chain client — for SOL it would need two Jupiter swaps in one tx
 (>1500 bytes, busts the 1232-byte tx size limit). The on-chain
 `programs/wired-router/` program would enable USDC/USDF splitting in one

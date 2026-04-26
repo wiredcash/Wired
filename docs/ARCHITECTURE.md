@@ -143,7 +143,7 @@ re-renders live as the quotes come in; the `RouteSummary` panel shows
 
 ## Splitting (intentionally not implemented yet)
 
-Real split routing — *e.g. 30% via Jupiter, 70% via the curve* — would need
+Real split routing — *e.g. some via Jupiter, the rest via the curve* — would need
 either:
 
 1. **Two Jupiter swaps in one tx** for any input that requires Jupiter on
