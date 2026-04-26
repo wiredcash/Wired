@@ -65,6 +65,14 @@ export type QuoteOptions = {
    * no feeAccount (or vice versa).
    */
   platformFeeBps?: number;
+  /**
+   * Cap on the total accounts the Jupiter swap can reference. Default
+   * 64; we ship with 32 so the combined Jupiter+bridge+flipcash tx
+   * always fits in Solana's 1232-byte limit. Lower values prefer
+   * direct/short routes; very low values may limit the routes Jupiter
+   * can find.
+   */
+  maxAccounts?: number;
 };
 
 /**
@@ -90,6 +98,8 @@ export async function getJupiterQuote(
     search.set("restrictIntermediateTokens", "true");
   if (opts.platformFeeBps && opts.platformFeeBps > 0)
     search.set("platformFeeBps", opts.platformFeeBps.toString());
+  if (opts.maxAccounts && opts.maxAccounts > 0)
+    search.set("maxAccounts", opts.maxAccounts.toString());
 
   const r = await fetch(
     `${proxyBase()}/api/jupiter/quote?${search.toString()}`,

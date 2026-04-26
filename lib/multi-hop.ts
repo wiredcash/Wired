@@ -46,6 +46,15 @@ export type SellRoute = "to-usdf" | "to-usdc" | "to-jupiter";
 
 const TX_SIZE_LIMIT = 1232;
 
+/**
+ * Cap on Jupiter's swap account count. Jupiter's default is 64; we cap
+ * at 32 so the combined Jupiter + bridge + flipcash tx (which adds ~16
+ * accounts of our own) reliably fits in Solana's 1232-byte limit. The
+ * goal is "always one signature" — any route that exceeds this throws
+ * instead of silently splitting into two.
+ */
+const JUPITER_MAX_ACCOUNTS = 28;
+
 export type SignableStep = {
   /** Short label for UI progress: "Jupiter swap", "Bridge + buy", etc. */
   label: string;
@@ -124,6 +133,7 @@ export async function planMultiHopBuy(
       slippageBps: input.slippageBps,
       restrictIntermediateTokens: true,
       platformFeeBps: fee?.bps,
+      maxAccounts: JUPITER_MAX_ACCOUNTS,
     });
     usdcInBest = BigInt(jupiterQuote.outAmount);
     usdcInWorst = BigInt(jupiterQuote.otherAmountThreshold);
@@ -270,46 +280,13 @@ export async function planMultiHopBuy(
     };
   }
 
-  // Single tx too big → split. Only happens on jupiter-bridge route.
-  if (route !== "jupiter-bridge" || !jupiterIxs || !bridgeIx) {
-    throw new Error(
-      `Composed tx is ${singleTx.serialize().length} bytes, exceeds ${TX_SIZE_LIMIT} limit. ` +
-        `Try a smaller amount.`,
-    );
-  }
-
-  // TX1 — Jupiter only (use Jupiter's own compute budget, its setups,
-  // its swap, and its cleanup). Lands USDC in the user's USDC ATA.
-  const tx1Ixs: TransactionInstruction[] = [
-    ...jupiterIxs.compute,
-    ...jupiterIxs.setup,
-    jupiterIxs.swap,
-    ...(jupiterIxs.cleanup ? [jupiterIxs.cleanup] : []),
-  ];
-  const tx1 = buildV0Tx(tx1Ixs, input.user, blockhash, jupiterAlts);
-
-  // TX2 — bridge + flipcash buy. Uses worst-case USDC delivered by TX1.
-  const tx2Ixs: TransactionInstruction[] = [
-    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50_000 }),
-    ComputeBudgetProgram.setComputeUnitLimit({ units: 250_000 }),
-    ...setupAtas,
-    bridgeIx,
-    buyIx,
-  ];
-  const tx2 = buildV0Tx(tx2Ixs, input.user, blockhash, []);
-
-  return {
-    route,
-    atomic: false,
-    txs: [
-      { label: "Jupiter swap", tx: tx1, size: tx1.serialize().length },
-      { label: "Bridge + buy", tx: tx2, size: tx2.serialize().length },
-    ],
-    minTokensOutQuarks,
-    expectedTokensOut: buyQuoteBest.expectedTokensOut,
-    worstUsdfQuarks: usdfInWorst,
-    jupiterQuote,
-  };
+  // Should be unreachable with maxAccounts capped at JUPITER_MAX_ACCOUNTS,
+  // but guard anyway. We *don't* fall back to splitting — the user wants
+  // a single signature, so this path errors instead.
+  throw new Error(
+    `Route is too big to fit in one transaction (${singleTx.serialize().length} bytes). ` +
+      `Try a smaller amount or pay with USDF/USDC instead.`,
+  );
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -390,6 +367,7 @@ export async function planMultiHopSell(
       slippageBps: input.slippageBps,
       restrictIntermediateTokens: true,
       platformFeeBps: fee?.bps,
+      maxAccounts: JUPITER_MAX_ACCOUNTS,
     });
     jupiterSwap = await getJupiterSwapInstructions({
       quoteResponse: jupiterQuote,
@@ -507,44 +485,12 @@ export async function planMultiHopSell(
     };
   }
 
-  if (route !== "to-jupiter" || !jupiterIxs || !bridgeIx) {
-    throw new Error(
-      `Composed tx is ${singleTx.serialize().length} bytes, exceeds ${TX_SIZE_LIMIT} limit. ` +
-        `Try a smaller amount.`,
-    );
-  }
-
-  // TX1 — flipcash sell + bridge USDF→USDC. Lands USDC in the user's ATA.
-  const tx1Ixs: TransactionInstruction[] = [
-    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50_000 }),
-    ComputeBudgetProgram.setComputeUnitLimit({ units: 250_000 }),
-    ...setupAtas,
-    sellIx,
-    bridgeIx,
-  ];
-  const tx1 = buildV0Tx(tx1Ixs, input.user, blockhash, []);
-
-  // TX2 — Jupiter swap (USDC → output mint).
-  const tx2Ixs: TransactionInstruction[] = [
-    ...jupiterIxs.compute,
-    ...jupiterIxs.setup,
-    jupiterIxs.swap,
-    ...(jupiterIxs.cleanup ? [jupiterIxs.cleanup] : []),
-  ];
-  const tx2 = buildV0Tx(tx2Ixs, input.user, blockhash, jupiterAlts);
-
-  return {
-    route,
-    atomic: false,
-    txs: [
-      { label: "Sell + bridge", tx: tx1, size: tx1.serialize().length },
-      { label: "Jupiter swap", tx: tx2, size: tx2.serialize().length },
-    ],
-    minOutputQuarks,
-    expectedOutput,
-    worstUsdfQuarks: usdfWorst,
-    jupiterQuote,
-  };
+  // Same single-tx-only contract as the buy path: throw rather than
+  // splitting if the route can't fit, so the user only ever signs once.
+  throw new Error(
+    `Route is too big to fit in one transaction (${singleTx.serialize().length} bytes). ` +
+      `Try a smaller amount or sell to USDF/USDC instead.`,
+  );
 }
 
 // ─────────────────────────────────────────────────────────────────────
