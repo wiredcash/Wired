@@ -1,0 +1,19 @@
+[features]
+seeds = false
+skip-lint = false
+
+[programs.localnet]
+wired_router = "11111111111111111111111111111111"
+
+[programs.mainnet]
+wired_router = "11111111111111111111111111111111"
+
+[provider]
+cluster = "Localnet"
+wallet = "~/.config/solana/id.json"
+
+[scripts]
+test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts"
+
+[workspace]
+members = ["programs/wired-router"]

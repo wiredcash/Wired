@@ -29,3 +29,7 @@ yarn-error.log*
 # IDE
 .vscode/
 .idea/
+
+# Anchor / Solana program build artifacts
+target/
+.anchor/
