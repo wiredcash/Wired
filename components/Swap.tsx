@@ -1,39 +1,42 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { ComputeBudgetProgram, PublicKey, Transaction } from "@solana/web3.js";
+import { PublicKey, VersionedTransaction } from "@solana/web3.js";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { WalletMultiButton } from "@solana/wallet-adapter-react-ui";
 import {
   TOKEN_DECIMALS,
   USDF_BASE_MINT,
   USDF_DECIMALS,
-  planSell,
   quoteBuy,
   quoteSell,
-  usdfToMinOutQuarks,
 } from "@/lib/flipcash";
 import { USDC_MINT, USDF_MINT } from "@/lib/usdf-swap";
 import { SOL_MINT } from "@/lib/jupiter";
-import { planMultiHopBuy } from "@/lib/multi-hop";
+import {
+  planMultiHopBuy,
+  planMultiHopSell,
+  type SignableStep,
+} from "@/lib/multi-hop";
 import type { IndexedCurrency } from "@/lib/flipcash/index-currencies";
 import { fmtQuarks, parseInput } from "./format";
 import { fmtCompactNumber, fmtPct, fmtUsd } from "./format-numbers";
 import { useTokenBalance } from "./useTokenBalance";
 import { useSolBalance } from "./useSolBalance";
 import { useCurrencies } from "./useCurrencies";
+import { useJupiterQuote } from "./useJupiterQuote";
 import { TokenPicker } from "./TokenPicker";
 import { CurrencyIcon } from "./CurrencyIcon";
 import { TokenIcon } from "./TokenIcon";
 import { InputTokenChip } from "./InputTokenChip";
 
 type Direction = "buy" | "sell";
-type InputTokenKey = "USDF" | "USDC" | "SOL";
+type SideTokenKey = "USDF" | "USDC" | "SOL";
 
 const SLIPPAGE_OPTIONS_BPS = [50, 100, 300]; // 0.5% / 1% / 3%
 
-const INPUT_TOKEN_INFO: Record<
-  InputTokenKey,
+const SIDE_TOKEN: Record<
+  SideTokenKey,
   { mint: PublicKey; decimals: number; symbol: string }
 > = {
   USDF: { mint: USDF_MINT, decimals: USDF_DECIMALS, symbol: "USDF" },
@@ -44,27 +47,34 @@ const INPUT_TOKEN_INFO: Record<
 export function Swap() {
   const { connection } = useConnection();
   const { publicKey, sendTransaction, connected } = useWallet();
+
   const [refresh, setRefresh] = useState(0);
   const currencies = useCurrencies(refresh);
   const [selected, setSelected] = useState<IndexedCurrency | null>(null);
+
   const [direction, setDirection] = useState<Direction>("buy");
-  const [inputToken, setInputToken] = useState<InputTokenKey>("USDF");
+  // Source token in buy mode; receive token in sell mode. Defaults to USDF
+  // (single-hop) on both sides.
+  const [inputToken, setInputToken] = useState<SideTokenKey>("USDF");
+  const [outputToken, setOutputToken] = useState<SideTokenKey>("USDF");
+
   const [pickerOpen, setPickerOpen] = useState(false);
   const [input, setInput] = useState("");
   const [slippageBps, setSlippageBps] = useState<number>(100);
   const [submitting, setSubmitting] = useState(false);
+  const [submitProgress, setSubmitProgress] = useState<string>("");
   const [refreshing, setRefreshing] = useState(false);
   const [status, setStatus] = useState<
     | { kind: "idle" }
     | { kind: "error"; message: string }
-    | { kind: "success"; signature: string }
+    | { kind: "success"; signature: string; allSigs: string[] }
   >({ kind: "idle" });
 
   const isBuy = direction === "buy";
-  // Source token on buy: user-pickable (USDF / USDC / SOL). On sell, always
-  // the selected currency.
-  const inputInfo = INPUT_TOKEN_INFO[inputToken];
+  const sideToken = isBuy ? inputToken : outputToken;
+  const sideInfo = SIDE_TOKEN[sideToken];
 
+  // ─── Wallet balances ────────────────────────────────────────────────
   const usdf = useTokenBalance(publicKey, USDF_BASE_MINT, refresh);
   const usdc = useTokenBalance(publicKey, USDC_MINT, refresh);
   const sol = useSolBalance(publicKey, refresh);
@@ -72,18 +82,19 @@ export function Swap() {
     () => (selected ? new PublicKey(selected.mint) : null),
     [selected],
   );
-  const target = useTokenBalance(publicKey, targetMint ?? USDF_BASE_MINT, refresh);
-  // useTokenBalance always needs a mint; reuse USDF as a stable placeholder
-  // when no currency is selected yet — its result is unused in that branch.
+  const target = useTokenBalance(
+    publicKey,
+    targetMint ?? USDF_BASE_MINT,
+    refresh,
+  );
   const targetQuarks = targetMint ? target.quarks : null;
 
-  function buyBalanceFor(key: InputTokenKey): bigint | null {
+  function balanceFor(key: SideTokenKey): bigint | null {
     if (key === "USDF") return usdf.quarks;
     if (key === "USDC") return usdc.quarks;
     return sol.lamports;
   }
 
-  // Auto-pick the most-liquid currency on first load.
   useEffect(() => {
     if (!selected && currencies.data?.length) {
       const firstWithPool = currencies.data.find((c) => c.pool);
@@ -91,17 +102,65 @@ export function Swap() {
     }
   }, [currencies.data, selected]);
 
-  const sourceDecimals = isBuy ? inputInfo.decimals : TOKEN_DECIMALS;
-  const destDecimals = isBuy ? TOKEN_DECIMALS : USDF_DECIMALS;
-  const sourceBalance = isBuy ? buyBalanceFor(inputToken) : targetQuarks;
-  const destBalance = isBuy ? targetQuarks : usdf.quarks;
-  const sourceSymbol = isBuy ? inputInfo.symbol : (selected?.symbol ?? "");
+  const sourceDecimals = isBuy ? sideInfo.decimals : TOKEN_DECIMALS;
+  const destDecimals = isBuy ? TOKEN_DECIMALS : sideInfo.decimals;
+  const sourceBalance = isBuy ? balanceFor(inputToken) : targetQuarks;
+  const sourceSymbol = isBuy ? inputToken : (selected?.symbol ?? "");
 
   const inputQuarks = useMemo(
     () => parseInput(input, sourceDecimals),
     [input, sourceDecimals],
   );
 
+  // ─── Live Jupiter quote ─────────────────────────────────────────────
+  // Buy mode: input → USDC.   Sell mode: USDC → output.
+  const buyJupiterEnabled = isBuy && inputToken === "SOL";
+  const buyJup = useJupiterQuote(
+    buyJupiterEnabled,
+    sideInfo.mint.toBase58(),
+    USDC_MINT.toBase58(),
+    inputQuarks,
+    slippageBps,
+  );
+
+  // For sell side, Jupiter input is USDC = worst-case USDF after sell.
+  // We compute it from the sell quote first, then debounce a Jupiter quote
+  // sized at that USDC amount.
+  const sellQuoteRaw = useMemo(() => {
+    if (
+      isBuy ||
+      !selected?.reserveTokenQuarks ||
+      !selected?.reserveUsdfQuarks ||
+      inputQuarks === null ||
+      inputQuarks <= 0n
+    )
+      return null;
+    return quoteSell(
+      BigInt(selected.reserveTokenQuarks),
+      BigInt(selected.reserveUsdfQuarks),
+      inputQuarks,
+      selected.sellFeeBps ?? 100,
+    );
+  }, [isBuy, selected, inputQuarks]);
+
+  // Worst-case USDF (= USDC) we'd hand to Jupiter on sell side.
+  const sellUsdfWorstQuarks = useMemo(() => {
+    if (!sellQuoteRaw) return null;
+    const factor = (10_000 - slippageBps) / 10_000;
+    const minUsdf = sellQuoteRaw.expectedUsdfOut * factor;
+    return BigInt(Math.max(0, Math.floor(minUsdf * 10 ** USDF_DECIMALS)));
+  }, [sellQuoteRaw, slippageBps]);
+
+  const sellJupiterEnabled = !isBuy && outputToken === "SOL";
+  const sellJup = useJupiterQuote(
+    sellJupiterEnabled,
+    USDC_MINT.toBase58(),
+    sideInfo.mint.toBase58(),
+    sellUsdfWorstQuarks,
+    slippageBps,
+  );
+
+  // ─── Display quote ──────────────────────────────────────────────────
   const buyQuote = useMemo(() => {
     if (
       !isBuy ||
@@ -111,62 +170,83 @@ export function Swap() {
       inputQuarks <= 0n
     )
       return null;
-    // For non-USDF inputs the quote is approximate: it assumes 1:1 USD value
-    // (i.e., USDC = USDF) and ignores Jupiter's price impact. Good enough
-    // for display; the actual minOut on-chain uses the real worst-case
-    // amount returned from Jupiter at submit time.
-    const usdfApprox =
-      inputToken === "SOL"
-        ? // Skip the buy quote for SOL on display — we'll show "—" until
-          // the user submits and Jupiter's quote arrives.
-          0n
-        : inputQuarks;
-    if (usdfApprox === 0n) return null;
+    let usdfApprox: bigint;
+    if (inputToken === "SOL") {
+      if (!buyJup.quote) return null;
+      usdfApprox = BigInt(buyJup.quote.outAmount);
+    } else {
+      // USDF and USDC are 1:1 at 6 decimals.
+      usdfApprox = inputQuarks;
+    }
     return quoteBuy(
       BigInt(selected.reserveTokenQuarks),
       BigInt(selected.reserveUsdfQuarks),
       usdfApprox,
     );
-  }, [isBuy, selected, inputQuarks, inputToken]);
+  }, [isBuy, selected, inputQuarks, inputToken, buyJup.quote]);
 
-  const sellQuote = useMemo(() => {
-    if (
-      isBuy ||
-      !selected?.reserveTokenQuarks ||
-      !selected?.reserveUsdfQuarks ||
-      selected?.sellFeeBps === null ||
-      inputQuarks === null ||
-      inputQuarks <= 0n
-    )
-      return null;
-    return quoteSell(
-      BigInt(selected!.reserveTokenQuarks!),
-      BigInt(selected!.reserveUsdfQuarks!),
-      inputQuarks,
-      selected!.sellFeeBps ?? 100,
-    );
-  }, [isBuy, selected, inputQuarks]);
+  // Sell-side display amount (in the user's chosen output mint's units).
+  const sellDisplayAmount = useMemo<{
+    formatted: string;
+    decimals: number;
+  } | null>(() => {
+    if (isBuy) return null;
+    if (!sellQuoteRaw) return null;
+    if (outputToken === "USDF") {
+      return {
+        formatted: fmtCompactNumber(sellQuoteRaw.expectedUsdfOut),
+        decimals: USDF_DECIMALS,
+      };
+    }
+    if (outputToken === "USDC") {
+      return {
+        formatted: fmtCompactNumber(sellQuoteRaw.expectedUsdfOut),
+        decimals: USDF_DECIMALS,
+      };
+    }
+    // SOL — wait for Jupiter
+    if (!sellJup.quote) return null;
+    const outQuarks = Number(sellJup.quote.outAmount);
+    return {
+      formatted: fmtCompactNumber(outQuarks / 10 ** sideInfo.decimals),
+      decimals: sideInfo.decimals,
+    };
+  }, [isBuy, sellQuoteRaw, outputToken, sellJup.quote, sideInfo.decimals]);
 
-  const expectedOutDisplay = isBuy
-    ? buyQuote
-      ? fmtCompactNumber(buyQuote.expectedTokensOut)
-      : "0"
-    : sellQuote
-      ? fmtCompactNumber(sellQuote.expectedUsdfOut)
-      : "0";
+  const expectedOutDisplay = useMemo(() => {
+    if (isBuy) {
+      if (inputToken === "SOL" && buyJup.loading && !buyQuote) return "…";
+      return buyQuote ? fmtCompactNumber(buyQuote.expectedTokensOut) : "0";
+    }
+    if (outputToken === "SOL" && sellJup.loading && !sellDisplayAmount) {
+      return "…";
+    }
+    return sellDisplayAmount ? sellDisplayAmount.formatted : "0";
+  }, [
+    isBuy,
+    inputToken,
+    outputToken,
+    buyJup.loading,
+    buyQuote,
+    sellJup.loading,
+    sellDisplayAmount,
+  ]);
 
   const priceLabel = useMemo(() => {
     if (!selected) return "—";
     if (isBuy) {
-      return buyQuote
-        ? `≈ ${fmtUsd(buyQuote.effectivePriceUsdf)} / ${selected.symbol}`
+      if (buyQuote)
+        return `≈ ${fmtUsd(buyQuote.effectivePriceUsdf)} / ${selected.symbol}`;
+      return inputToken === "SOL" && buyJup.loading
+        ? "fetching route…"
         : "spot price";
     }
-    return sellQuote
-      ? `≈ ${fmtUsd(sellQuote.effectivePriceUsdf)} / ${selected.symbol}`
-      : "spot price";
-  }, [isBuy, selected, buyQuote, sellQuote]);
+    if (sellQuoteRaw)
+      return `≈ ${fmtUsd(sellQuoteRaw.effectivePriceUsdf)} / ${selected.symbol}`;
+    return "spot price";
+  }, [isBuy, selected, buyQuote, sellQuoteRaw, inputToken, buyJup.loading]);
 
+  // ─── Validation ─────────────────────────────────────────────────────
   const validation = useMemo<{ ok: boolean; reason?: string }>(() => {
     if (!connected || !publicKey)
       return { ok: false, reason: "Connect wallet" };
@@ -182,18 +262,17 @@ export function Swap() {
       };
     if (inputQuarks === null) return { ok: false, reason: "Invalid amount" };
     if (inputQuarks <= 0n) return { ok: false, reason: "Amount must be > 0" };
-    if (sourceBalance !== null && inputQuarks > sourceBalance) {
-      return {
-        ok: false,
-        reason: `Insufficient ${sourceSymbol}`,
-      };
-    }
+    if (sourceBalance !== null && inputQuarks > sourceBalance)
+      return { ok: false, reason: `Insufficient ${sourceSymbol}` };
     if (!isBuy) {
-      // Selling needs the pool to have at least the gross USDF available.
-      if (!sellQuote) return { ok: false, reason: "Computing quote…" };
-      if (sellQuote.expectedUsdfOut <= 0)
+      if (!sellQuoteRaw) return { ok: false, reason: "Computing quote…" };
+      if (sellQuoteRaw.expectedUsdfOut <= 0)
         return { ok: false, reason: "Pool has no USDF reserve" };
+      if (outputToken === "SOL" && sellJup.loading && !sellJup.quote)
+        return { ok: false, reason: "Fetching route…" };
     }
+    if (isBuy && inputToken === "SOL" && buyJup.loading && !buyJup.quote)
+      return { ok: false, reason: "Fetching route…" };
     return { ok: true };
   }, [
     connected,
@@ -202,11 +281,18 @@ export function Swap() {
     input,
     inputQuarks,
     sourceBalance,
-    sellQuote,
+    sellQuoteRaw,
     isBuy,
+    inputToken,
+    outputToken,
     sourceSymbol,
+    buyJup.loading,
+    buyJup.quote,
+    sellJup.loading,
+    sellJup.quote,
   ]);
 
+  // ─── Actions ────────────────────────────────────────────────────────
   function flip() {
     setDirection((d) => (d === "buy" ? "sell" : "buy"));
     setInput("");
@@ -217,14 +303,24 @@ export function Swap() {
     if (refreshing) return;
     setRefreshing(true);
     setRefresh((r) => r + 1);
-    // Match the spin animation length so the button feels responsive even
-    // when the RPC roundtrip is faster than 700ms.
     window.setTimeout(() => setRefreshing(false), 700);
   }
 
   function setMax() {
     if (sourceBalance === null || sourceBalance <= 0n) return;
     setInput(fmtQuarks(sourceBalance, sourceDecimals, sourceDecimals));
+  }
+
+  async function sendStep(
+    step: SignableStep,
+  ): Promise<string> {
+    const sig = await sendTransaction(step.tx, connection);
+    const latest = await connection.getLatestBlockhash();
+    await connection.confirmTransaction(
+      { signature: sig, ...latest },
+      "confirmed",
+    );
+    return sig;
   }
 
   async function handleSubmit() {
@@ -238,82 +334,73 @@ export function Swap() {
     )
       return;
     setSubmitting(true);
+    setSubmitProgress("");
     setStatus({ kind: "idle" });
     try {
-      if (isBuy) {
-        // Multi-hop buy: input → (Jupiter) → USDC → (bridge) → USDF → buy.
-        // Jupiter is skipped when input is USDC/USDF; bridge skipped when
-        // input is USDF.
-        const plan = await planMultiHopBuy(connection, {
-          user: publicKey,
-          inputMint: inputInfo.mint,
-          inAmount: inputQuarks,
-          slippageBps,
-          target: {
-            mint: new PublicKey(selected.mint),
-            pool: new PublicKey(selected.pool),
-            vaultA: new PublicKey(selected.vaultA),
-            vaultB: new PublicKey(selected.vaultB),
-            reserveTokenQuarks: BigInt(selected.reserveTokenQuarks ?? "0"),
-            reserveUsdfQuarks: BigInt(selected.reserveUsdfQuarks ?? "0"),
-          },
-        });
+      const txs: SignableStep[] = isBuy
+        ? (
+            await planMultiHopBuy(connection, {
+              user: publicKey,
+              inputMint: sideInfo.mint,
+              inAmount: inputQuarks,
+              slippageBps,
+              target: {
+                mint: new PublicKey(selected.mint),
+                pool: new PublicKey(selected.pool),
+                vaultA: new PublicKey(selected.vaultA),
+                vaultB: new PublicKey(selected.vaultB),
+                reserveTokenQuarks: BigInt(selected.reserveTokenQuarks ?? "0"),
+                reserveUsdfQuarks: BigInt(selected.reserveUsdfQuarks ?? "0"),
+              },
+            })
+          ).txs
+        : (
+            await planMultiHopSell(connection, {
+              user: publicKey,
+              sourceMint: new PublicKey(selected.mint),
+              inAmount: inputQuarks,
+              outputMint: sideInfo.mint,
+              slippageBps,
+              source: {
+                pool: new PublicKey(selected.pool),
+                vaultA: new PublicKey(selected.vaultA),
+                vaultB: new PublicKey(selected.vaultB),
+                reserveTokenQuarks: BigInt(selected.reserveTokenQuarks ?? "0"),
+                reserveUsdfQuarks: BigInt(selected.reserveUsdfQuarks ?? "0"),
+                sellFeeBps: selected.sellFeeBps ?? 100,
+              },
+            })
+          ).txs;
 
-        const sig = await sendTransaction(plan.tx, connection);
-        const latest = await connection.getLatestBlockhash();
-        await connection.confirmTransaction(
-          { signature: sig, ...latest },
-          "confirmed",
-        );
-        setStatus({ kind: "success", signature: sig });
-        setInput("");
-        setRefresh((r) => r + 1);
-        return;
+      const sigs: string[] = [];
+      for (let i = 0; i < txs.length; i++) {
+        if (txs.length > 1) {
+          setSubmitProgress(`${i + 1}/${txs.length} · ${txs[i].label}`);
+        }
+        const sig = await sendStep(txs[i]);
+        sigs.push(sig);
       }
-
-      // Sell flow stays single-hop.
-      if (!sellQuote) throw new Error("missing sell quote");
-      const minOut = usdfToMinOutQuarks(
-        sellQuote.expectedUsdfOut,
-        slippageBps,
-      );
-      const plan = await planSell(connection, {
-        seller: publicKey,
-        pool: new PublicKey(selected.pool),
-        targetMint: new PublicKey(selected.mint),
-        vaultA: new PublicKey(selected.vaultA),
-        vaultB: new PublicKey(selected.vaultB),
-        inAmountTokenQuarks: inputQuarks,
-        minAmountOutUsdfQuarks: minOut,
+      setStatus({
+        kind: "success",
+        signature: sigs[sigs.length - 1],
+        allSigs: sigs,
       });
-      const tx = new Transaction();
-      tx.add(
-        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50_000 }),
-        ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 }),
-        ...plan.preInstructions,
-        plan.sellIx,
-      );
-      const sig = await sendTransaction(tx, connection);
-      const latest = await connection.getLatestBlockhash();
-      await connection.confirmTransaction(
-        { signature: sig, ...latest },
-        "confirmed",
-      );
-      setStatus({ kind: "success", signature: sig });
       setInput("");
       setRefresh((r) => r + 1);
     } catch (err) {
       setStatus({ kind: "error", message: (err as Error).message });
     } finally {
       setSubmitting(false);
+      setSubmitProgress("");
     }
   }
 
+  // ─── Chips ──────────────────────────────────────────────────────────
   const sourceTokenChip = isBuy ? (
     <InputTokenChip
       selected={inputToken}
       onSelect={(k) => {
-        setInputToken(k as InputTokenKey);
+        setInputToken(k as SideTokenKey);
         setInput("");
       }}
     />
@@ -323,11 +410,25 @@ export function Swap() {
   const destTokenChip = isBuy ? (
     <CurrencyChip selected={selected} onClick={() => setPickerOpen(true)} />
   ) : (
-    <UsdfChip />
+    <InputTokenChip
+      selected={outputToken}
+      onSelect={(k) => setOutputToken(k as SideTokenKey)}
+    />
   );
 
-  const activeQuote = isBuy ? buyQuote : sellQuote;
+  const activeQuoteImpact = isBuy
+    ? buyQuote?.priceImpact
+    : sellQuoteRaw?.priceImpact;
   const sellFeeBps = selected?.sellFeeBps ?? null;
+
+  // Combined Jupiter price-impact in addition to curve impact.
+  const jupiterImpactPct = isBuy
+    ? buyJup.quote
+      ? Number(buyJup.quote.priceImpactPct)
+      : null
+    : sellJup.quote
+      ? Number(sellJup.quote.priceImpactPct)
+      : null;
 
   return (
     <div className="card p-2.5 shadow-card">
@@ -342,7 +443,9 @@ export function Swap() {
               ? inputToken === "USDF"
                 ? "· buy"
                 : `· buy via ${inputToken}`
-              : "· sell"}
+              : outputToken === "USDF"
+                ? "· sell"
+                : `· sell to ${outputToken}`}
           </span>
         </div>
         <div className="flex items-center gap-2">
@@ -398,31 +501,34 @@ export function Swap() {
           </span>
         </div>
         <div className="flex items-center gap-3">
-          <div className="flex-1 min-w-0 text-[34px] sm:text-[40px] font-semibold tabular-nums tracking-[-0.03em] text-white/85">
+          <div
+            className={
+              "flex-1 min-w-0 text-[34px] sm:text-[40px] font-semibold tabular-nums tracking-[-0.03em] " +
+              (expectedOutDisplay === "…" ? "text-white/40" : "text-white/85")
+            }
+          >
             {expectedOutDisplay}
           </div>
           {destTokenChip}
         </div>
 
-        {selected && activeQuote && (
+        {selected && (activeQuoteImpact !== undefined || jupiterImpactPct !== null) && (
           <div className="mt-3 flex items-center justify-between text-[11px] text-white/45">
             <span>
               Impact{" "}
               <span
-                className={
-                  activeQuote.priceImpact > 0.05
-                    ? "text-err"
-                    : activeQuote.priceImpact > 0.01
-                      ? "text-spark"
-                      : "text-white/65"
-                }
+                className={impactClass(
+                  combinedImpact(activeQuoteImpact, jupiterImpactPct),
+                )}
               >
-                {fmtPct(activeQuote.priceImpact, 2)}
+                {fmtPct(combinedImpact(activeQuoteImpact, jupiterImpactPct), 2)}
               </span>
             </span>
             <span className="tabular-nums">
               {isBuy
-                ? `Mcap ${fmtUsd(activeQuote.marketCapUsdf)}`
+                ? buyQuote
+                  ? `Mcap ${fmtUsd(buyQuote.marketCapUsdf)}`
+                  : ""
                 : `Fee ${
                     sellFeeBps !== null ? (sellFeeBps / 100).toFixed(2) : "1.00"
                   }%`}
@@ -433,9 +539,7 @@ export function Swap() {
 
       {/* Slippage */}
       <div className="flex items-center justify-between px-1 pt-3 pb-1 text-[11px]">
-        <span className="text-white/40 uppercase tracking-wider">
-          Slippage
-        </span>
+        <span className="text-white/40 uppercase tracking-wider">Slippage</span>
         <div className="flex gap-1">
           {SLIPPAGE_OPTIONS_BPS.map((bps) => (
             <button
@@ -462,7 +566,7 @@ export function Swap() {
         className="mt-2 w-full h-12 rounded-2xl bg-white text-black disabled:bg-white/[0.05] disabled:text-white/40 disabled:hover:shadow-none hover:shadow-glow font-semibold text-[14px] tracking-tight transition-all duration-200 disabled:cursor-not-allowed"
       >
         {submitting
-          ? "Confirming…"
+          ? submitProgress || "Confirming…"
           : validation.ok
             ? `${isBuy ? "Buy" : "Sell"} ${selected?.symbol ?? ""}`
             : (validation.reason ?? (isBuy ? "Buy" : "Sell"))}
@@ -475,7 +579,10 @@ export function Swap() {
           rel="noreferrer"
           className="mt-3 mx-1 flex items-center justify-between gap-2 rounded-xl bg-ok/[0.07] border border-ok/20 px-3 py-2.5 text-[12.5px] text-ok hover:bg-ok/[0.12] transition-colors"
         >
-          <span>✅ {isBuy ? "Buy" : "Sell"} landed</span>
+          <span>
+            ✅ {isBuy ? "Buy" : "Sell"} landed
+            {status.allSigs.length > 1 ? ` (${status.allSigs.length} txs)` : ""}
+          </span>
           <span className="font-mono text-[11px] truncate max-w-[160px] opacity-80">
             {status.signature.slice(0, 10)}…
           </span>
@@ -495,6 +602,19 @@ export function Swap() {
       />
     </div>
   );
+}
+
+function combinedImpact(
+  curve: number | undefined,
+  jupiter: number | null,
+): number {
+  return (curve ?? 0) + (jupiter ?? 0);
+}
+
+function impactClass(impact: number): string {
+  if (impact > 0.05) return "text-err";
+  if (impact > 0.01) return "text-spark";
+  return "text-white/65";
 }
 
 function CurrencyChip({
@@ -531,15 +651,6 @@ function CurrencyChip({
         </>
       )}
     </button>
-  );
-}
-
-function UsdfChip() {
-  return (
-    <div className="shrink-0 flex items-center gap-1.5 pl-1 pr-2.5 py-1 rounded-full bg-white/[0.05] border border-white/[0.08]">
-      <TokenIcon symbol="USDF" size={20} />
-      <span className="text-[13px] font-semibold tracking-tight">USDF</span>
-    </div>
   );
 }
 

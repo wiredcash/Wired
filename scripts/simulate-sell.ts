@@ -1,34 +1,29 @@
 #!/usr/bin/env tsx
 /**
- * Compose a multi-hop buy tx end-to-end and report tx size + simulation
- * outcome. Doesn't sign or send. Useful for confirming a given (input,
- * amount, target) combination fits in a single Solana tx.
+ * Simulate a multi-hop sell: currency → USDF → (bridge) USDC → (Jupiter) any.
  *
- *   npx tsx scripts/simulate-multihop.ts <symbol> <input-token> <amount>
+ *   npx tsx scripts/simulate-sell.ts <symbol> <output-token> <amount>
  *
- *   <symbol>       Flipcash currency symbol (e.g. JFY, MNY)
- *   <input-token>  USDF | USDC | SOL
- *   <amount>       Display units of the input (e.g. 0.05 SOL, 1 USDC, 0.5 USDF)
+ *   <symbol>        Currency to sell (e.g. JFY)
+ *   <output-token>  USDF | USDC | SOL
+ *   <amount>        Currency-token amount in display units (e.g. 1.5 JFY)
  */
-import { Connection, Keypair, PublicKey, VersionedTransaction } from "@solana/web3.js";
+import { Connection, Keypair, PublicKey } from "@solana/web3.js";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import {
-  USDC_MINT,
-  USDF_MINT,
-} from "../lib/usdf-swap";
+import { USDC_MINT, USDF_MINT } from "../lib/usdf-swap";
 import { SOL_MINT } from "../lib/jupiter";
-import { planMultiHopBuy } from "../lib/multi-hop";
-import { TOKEN_DECIMALS, USDF_DECIMALS } from "../lib/flipcash";
+import { planMultiHopSell } from "../lib/multi-hop";
+import { TOKEN_DECIMALS } from "../lib/flipcash";
 
 const RPC =
   process.env.SOLANA_RPC_URL ??
   "https://mainnet.helius-rpc.com/?api-key=027318d4-f3d4-4ff3-a490-c945bdb3a0af";
 
-const INPUT_MINTS: Record<string, { mint: PublicKey; decimals: number }> = {
-  USDF: { mint: USDF_MINT, decimals: USDF_DECIMALS },
-  USDC: { mint: USDC_MINT, decimals: USDF_DECIMALS },
-  SOL: { mint: SOL_MINT, decimals: 9 },
+const OUTPUT_MINTS: Record<string, PublicKey> = {
+  USDF: USDF_MINT,
+  USDC: USDC_MINT,
+  SOL: SOL_MINT,
 };
 
 function toQuarks(amount: string, decimals: number): bigint {
@@ -38,17 +33,15 @@ function toQuarks(amount: string, decimals: number): bigint {
 }
 
 async function main() {
-  const [symbol, inputKey, amountStr] = process.argv.slice(2);
-  if (!symbol || !inputKey || !amountStr) {
-    console.error("usage: simulate-multihop <symbol> <USDF|USDC|SOL> <amount>");
+  const [symbol, outputKey, amountStr] = process.argv.slice(2);
+  if (!symbol || !outputKey || !amountStr) {
+    console.error("usage: simulate-sell <symbol> <USDF|USDC|SOL> <amount>");
     process.exit(2);
   }
-  const inputInfo = INPUT_MINTS[inputKey.toUpperCase()];
-  if (!inputInfo) throw new Error(`unknown input ${inputKey}`);
+  const outputMint = OUTPUT_MINTS[outputKey.toUpperCase()];
+  if (!outputMint) throw new Error(`unknown output ${outputKey}`);
 
   const conn = new Connection(RPC, "confirmed");
-
-  // Pull the indexer to find the target currency by symbol.
   const idxRes = await fetch(
     "http://localhost:3127/api/currencies",
   ).then((r) => r.json());
@@ -60,6 +53,7 @@ async function main() {
     vaultB: string | null;
     reserveTokenQuarks: string | null;
     reserveUsdfQuarks: string | null;
+    sellFeeBps: number | null;
   }>).find(
     (x) => x.symbol.toUpperCase() === symbol.toUpperCase() && x.pool,
   );
@@ -69,32 +63,21 @@ async function main() {
   const secret = JSON.parse(readFileSync(keypairPath, "utf8"));
   const signer = Keypair.fromSecretKey(Uint8Array.from(secret));
 
-  const inAmount = toQuarks(amountStr, inputInfo.decimals);
+  const inAmount = toQuarks(amountStr, TOKEN_DECIMALS);
 
-  console.log(
-    JSON.stringify(
-      {
-        signer: signer.publicKey.toBase58(),
-        target: { symbol: c.symbol, mint: c.mint, pool: c.pool },
-        input: `${amountStr} ${inputKey} (${inAmount} smallest units)`,
-      },
-      null,
-      2,
-    ),
-  );
-
-  const plan = await planMultiHopBuy(conn, {
+  const plan = await planMultiHopSell(conn, {
     user: signer.publicKey,
-    inputMint: inputInfo.mint,
+    sourceMint: new PublicKey(c.mint),
     inAmount,
+    outputMint,
     slippageBps: 100,
-    target: {
-      mint: new PublicKey(c.mint),
+    source: {
       pool: new PublicKey(c.pool!),
       vaultA: new PublicKey(c.vaultA!),
       vaultB: new PublicKey(c.vaultB!),
       reserveTokenQuarks: BigInt(c.reserveTokenQuarks ?? "0"),
       reserveUsdfQuarks: BigInt(c.reserveUsdfQuarks ?? "0"),
+      sellFeeBps: c.sellFeeBps ?? 100,
     },
   });
 
@@ -106,8 +89,8 @@ async function main() {
         txCount: plan.txs.length,
         txSizes: plan.txs.map((t) => ({ label: t.label, size: t.size })),
         worstUsdfQuarks: plan.worstUsdfQuarks.toString(),
-        minTokensOutQuarks: plan.minTokensOutQuarks.toString(),
-        expectedTokensOut: plan.expectedTokensOut,
+        minOutputQuarks: plan.minOutputQuarks.toString(),
+        expectedOutput: plan.expectedOutput,
         jupiterImpact: plan.jupiterQuote?.priceImpactPct ?? null,
       },
       null,
@@ -115,17 +98,15 @@ async function main() {
     ),
   );
 
-  // Sign + simulate the first tx (others depend on its state landing).
   const first = plan.txs[0];
   first.tx.sign([signer]);
   const sim = await conn.simulateTransaction(first.tx, {
     sigVerify: false,
     replaceRecentBlockhash: true,
   });
-  console.log("--- simulation (first tx) ---");
+  console.log("--- sim (first tx) ---");
   console.log("err:", sim.value.err);
-  console.log("logs (last 12):");
-  for (const l of (sim.value.logs ?? []).slice(-12)) console.log("  " + l);
+  for (const l of (sim.value.logs ?? []).slice(-10)) console.log("  " + l);
 }
 
 main().catch((e) => {
