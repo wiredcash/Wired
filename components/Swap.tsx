@@ -39,6 +39,7 @@ export function Swap() {
   const [input, setInput] = useState("");
   const [slippageBps, setSlippageBps] = useState<number>(100);
   const [submitting, setSubmitting] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const [status, setStatus] = useState<
     | { kind: "idle" }
     | { kind: "error"; message: string }
@@ -172,6 +173,15 @@ export function Swap() {
     setStatus({ kind: "idle" });
   }
 
+  function refreshBalances() {
+    if (refreshing) return;
+    setRefreshing(true);
+    setRefresh((r) => r + 1);
+    // Match the spin animation length so the button feels responsive even
+    // when the RPC roundtrip is faster than 700ms.
+    window.setTimeout(() => setRefreshing(false), 700);
+  }
+
   function setMax() {
     if (sourceBalance === null || sourceBalance <= 0n) return;
     setInput(fmtQuarks(sourceBalance, sourceDecimals, sourceDecimals));
@@ -272,7 +282,10 @@ export function Swap() {
             {isBuy ? "· buy" : "· sell"}
           </span>
         </div>
-        <WalletMultiButton />
+        <div className="flex items-center gap-2">
+          <RefreshButton spinning={refreshing} onClick={refreshBalances} />
+          <WalletMultiButton />
+        </div>
       </div>
 
       {/* You pay */}
@@ -464,6 +477,40 @@ function UsdfChip() {
       <TokenIcon symbol="USDF" size={20} />
       <span className="text-[13px] font-semibold tracking-tight">USDF</span>
     </div>
+  );
+}
+
+function RefreshButton({
+  spinning,
+  onClick,
+}: {
+  spinning: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={spinning}
+      aria-label="Refresh balances"
+      className="w-9 h-9 rounded-full bg-white/[0.04] border border-white/[0.08] flex items-center justify-center text-white/55 hover:text-white hover:bg-white/[0.08] hover:border-white/20 transition-colors disabled:cursor-default"
+    >
+      <svg
+        width="14"
+        height="14"
+        viewBox="0 0 24 24"
+        fill="none"
+        className={spinning ? "animate-spin" : ""}
+      >
+        <path
+          d="M3 12a9 9 0 0 1 15.5-6.3L21 8M21 4v4h-4M21 12a9 9 0 0 1-15.5 6.3L3 16M3 20v-4h4"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+      </svg>
+    </button>
   );
 }
 
