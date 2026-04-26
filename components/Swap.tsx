@@ -30,6 +30,7 @@ import { TokenPicker } from "./TokenPicker";
 import { CurrencyIcon } from "./CurrencyIcon";
 import { TokenIcon } from "./TokenIcon";
 import { InputTokenChip } from "./InputTokenChip";
+import { SwapSuccessModal, type SwapSummary } from "./SwapSuccessModal";
 
 type Direction = "buy" | "sell";
 type SideTokenKey = "USDF" | "USDC" | "SOL";
@@ -70,6 +71,9 @@ export function Swap() {
     | { kind: "error"; message: string }
     | { kind: "success"; signature: string; allSigs: string[] }
   >({ kind: "idle" });
+  const [successSummary, setSuccessSummary] = useState<SwapSummary | null>(
+    null,
+  );
 
   const isBuy = direction === "buy";
   const sideToken = isBuy ? inputToken : outputToken;
@@ -369,6 +373,19 @@ export function Swap() {
     setSubmitting(true);
     setSubmitProgress("");
     setStatus({ kind: "idle" });
+    // Snapshot the user-facing amounts at submit time — `input` gets cleared
+    // on success and we want the modal to show what they actually paid.
+    const paidAmountStr = input;
+    const expectedOutStr = expectedOutDisplay;
+    const sideSymbolAtSubmit = sideToken;
+    const sideIconSrc =
+      sideToken === "SOL"
+        ? "https://raw.githubusercontent.com/solana-labs/token-list/main/assets/mainnet/So11111111111111111111111111111111111111112/logo.png"
+        : sideToken === "USDC"
+          ? "/usdc.png"
+          : "/usdf.png";
+    const currencySymbol = selected.symbol;
+    const currencyIcon = selected.image ?? null;
     try {
       const txs: SignableStep[] = isBuy
         ? (
@@ -417,6 +434,32 @@ export function Swap() {
         kind: "success",
         signature: sigs[sigs.length - 1],
         allSigs: sigs,
+      });
+      setSuccessSummary({
+        direction: isBuy ? "buy" : "sell",
+        paid: isBuy
+          ? {
+              amount: paidAmountStr,
+              symbol: sideSymbolAtSubmit,
+              iconSrc: sideIconSrc,
+            }
+          : {
+              amount: paidAmountStr,
+              symbol: currencySymbol,
+              iconSrc: currencyIcon,
+            },
+        received: isBuy
+          ? {
+              amount: expectedOutStr,
+              symbol: currencySymbol,
+              iconSrc: currencyIcon,
+            }
+          : {
+              amount: expectedOutStr,
+              symbol: sideSymbolAtSubmit,
+              iconSrc: sideIconSrc,
+            },
+        signatures: sigs,
       });
       setInput("");
       setRefresh((r) => r + 1);
@@ -562,9 +605,9 @@ export function Swap() {
                 ? buyQuote
                   ? `Mcap ${fmtUsd(buyQuote.marketCapUsdf)}`
                   : ""
-                : `Fee ${
-                    sellFeeBps !== null ? (sellFeeBps / 100).toFixed(2) : "1.00"
-                  }%`}
+                : sellQuoteRaw
+                  ? `Mcap ${fmtUsd(sellQuoteRaw.marketCapUsdf)}`
+                  : ""}
             </span>
           </div>
         )}
@@ -605,22 +648,6 @@ export function Swap() {
             : (validation.reason ?? (isBuy ? "Buy" : "Sell"))}
       </button>
 
-      {status.kind === "success" && (
-        <a
-          href={`https://solscan.io/tx/${status.signature}`}
-          target="_blank"
-          rel="noreferrer"
-          className="mt-3 mx-1 flex items-center justify-between gap-2 rounded-xl bg-ok/[0.07] border border-ok/20 px-3 py-2.5 text-[12.5px] text-ok hover:bg-ok/[0.12] transition-colors"
-        >
-          <span>
-            ✅ {isBuy ? "Buy" : "Sell"} landed
-            {status.allSigs.length > 1 ? ` (${status.allSigs.length} txs)` : ""}
-          </span>
-          <span className="font-mono text-[11px] truncate max-w-[160px] opacity-80">
-            {status.signature.slice(0, 10)}…
-          </span>
-        </a>
-      )}
       {status.kind === "error" && (
         <p className="mt-3 mx-1 text-[12.5px] text-err break-words rounded-xl bg-err/[0.07] border border-err/20 px-3 py-2.5">
           {status.message}
@@ -632,6 +659,11 @@ export function Swap() {
         onClose={() => setPickerOpen(false)}
         onSelect={(c) => setSelected(c)}
         currencies={currencies.data}
+      />
+
+      <SwapSuccessModal
+        summary={successSummary}
+        onClose={() => setSuccessSummary(null)}
       />
     </div>
   );
