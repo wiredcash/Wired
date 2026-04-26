@@ -156,7 +156,7 @@ export function Bridge() {
     <div className="card p-2.5 shadow-card">
       <div className="flex items-center justify-between px-2.5 pt-1.5 pb-2.5">
         <div className="flex items-center gap-2">
-          <span className="inline-block w-1.5 h-1.5 rounded-full bg-spark animate-pulse-soft" />
+          <span className="inline-block w-1 h-1 rounded-full bg-white/30" />
           <span className="text-[12px] font-medium text-white/65 tracking-wide">
             Bridge
           </span>
@@ -260,7 +260,7 @@ function TokenInput(props: {
             <button
               type="button"
               onClick={props.onMax}
-              className="px-1.5 py-0.5 rounded-md text-[10.5px] font-semibold text-spark hover:bg-spark/10 transition-colors"
+              className="px-1.5 py-0.5 rounded-md text-[10.5px] font-semibold text-white/55 hover:text-white hover:bg-white/[0.06] transition-colors"
             >
               MAX
             </button>
